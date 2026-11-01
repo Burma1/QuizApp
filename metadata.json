@@ -1,0 +1,6 @@
+{
+  "name": "QuizApp",
+  "description": "Smart flashcards, Anki SM-2 spaced repetition learning in 8-card blocks, test preparation, photo-to-flashcard scanner, file import/export and multi-provider AI tutor for mastering any subject.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

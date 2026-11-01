@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Back tilted flashcard -->
+    <path
+        android:fillColor="#16A34A"
+        android:fillAlpha="0.38"
+        android:pathData="M36,28 L70,24 C73.3,23.6 76.3,26 76.7,29.3 L81,65 C81.4,68.3 79,71.3 75.7,71.7 L41.7,75.7 C38.4,76.1 35.4,73.7 35,70.4 L30.7,34.7 C30.3,31.4 32.7,28.4 36,28 Z" />
+    <!-- Front flashcard -->
+    <path
+        android:fillColor="#22C55E"
+        android:pathData="M34,33 L68,33 C71.3,33 74,35.7 74,39 L74,73 C74,76.3 71.3,79 68,79 L34,79 C30.7,79 28,76.3 28,73 L28,39 C28,35.7 30.7,33 34,33 Z" />
+    <!-- Inner card highlight & check mark -->
+    <path
+        android:fillColor="#0F1C14"
+        android:pathData="M47.5,63.2 L39.3,55 L42.1,52.2 L47.5,57.6 L59.9,45.2 L62.7,48 L47.5,63.2 Z" />
+</vector>
