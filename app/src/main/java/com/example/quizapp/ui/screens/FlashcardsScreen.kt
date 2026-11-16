@@ -1,6 +1,13 @@
 package com.example.quizapp.ui.screens
 
 import android.speech.tts.TextToSpeech
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -46,9 +53,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -79,7 +86,10 @@ fun FlashcardsScreen(
     customCards: List<Flashcard>? = null,
     onBack: () -> Unit,
     onUpdateMastery: (String, Boolean) -> Unit,
-    onToggleStar: (String) -> Unit = {}
+    onToggleStar: (String) -> Unit = {},
+    recentTtsLanguages: List<String> = emptyList(),
+    onAddRecentTtsLanguage: (String) -> Unit = {},
+    onClearRecentTtsLanguages: () -> Unit = {}
 ) {
     val s = LocalStrings.current
     val context = LocalContext.current
@@ -103,8 +113,12 @@ fun FlashcardsScreen(
     var currentBlockNumber by remember(allOrderedCards) { mutableIntStateOf(1) }
 
     var currentIndex by remember { mutableIntStateOf(0) }
-    var isFlipped by remember { mutableStateOf(false) }
-    var hasBeenOpened by remember(currentBlockCards.getOrNull(currentIndex)?.id) { mutableStateOf(false) }
+    val stepFlipMap = remember { mutableStateMapOf<String, Boolean>() }
+    var lastTransitionDir by remember { mutableIntStateOf(1) }
+    val activeCardId = currentBlockCards.getOrNull(currentIndex)?.id
+    val currentStepKey = "${currentBlockNumber}_${currentIndex}_${activeCardId.orEmpty()}"
+    val isFlipped = stepFlipMap[currentStepKey] ?: false
+    var hasBeenOpened by remember(currentStepKey) { mutableStateOf(false) }
     var stillLearningCount by remember { mutableIntStateOf(0) }
     var knowCount by remember { mutableIntStateOf(0) }
     var isAutoPlaying by remember { mutableStateOf(false) }
@@ -116,6 +130,7 @@ fun FlashcardsScreen(
     val historyStack = remember { mutableStateListOf<Pair<Flashcard, Boolean>>() }
 
     var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    var ttsPickerTargetText by remember { mutableStateOf<String?>(null) }
 
     DisposableEffect(context) {
         var engine: TextToSpeech? = null
@@ -131,7 +146,7 @@ fun FlashcardsScreen(
         }
     }
 
-    val speakText: (String) -> Unit = { text ->
+    val speakCardText: (String) -> Unit = { text ->
         com.example.quizapp.ui.components.SmartTtsHelper.speakSmart(ttsEngine, text)
     }
 
@@ -152,7 +167,7 @@ fun FlashcardsScreen(
                 nextUnseenCursor = newCursor
                 currentBlockNumber++
                 currentIndex = 0
-                isFlipped = false
+                lastTransitionDir = 1
                 hasBeenOpened = false
                 historyStack.clear()
             } else {
@@ -165,19 +180,21 @@ fun FlashcardsScreen(
         }
     }
 
-    LaunchedEffect(isAutoPlaying, currentIndex, isFlipped, currentBlockNumber) {
+    LaunchedEffect(isAutoPlaying, currentStepKey, isFlipped) {
         if (isAutoPlaying && currentBlockCards.isNotEmpty() && !showCompletionDialog) {
             delay(2200)
+            val activeCard = currentBlockCards[currentIndex]
             if (!isFlipped) {
-                isFlipped = true
+                stepFlipMap[currentStepKey] = true
                 hasBeenOpened = true
-                speakText(currentBlockCards[currentIndex].definition)
+                speakCardText(activeCard.definition)
             } else {
-                isFlipped = false
+                lastTransitionDir = 1
                 hasBeenOpened = false
                 if (currentIndex < currentBlockCards.size - 1) {
                     currentIndex++
-                    speakText(currentBlockCards[currentIndex].term)
+                    val nextCard = currentBlockCards[currentIndex]
+                    speakCardText(nextCard.term)
                 } else {
                     advanceToNextBlockOrFinish()
                 }
@@ -203,7 +220,7 @@ fun FlashcardsScreen(
                 }
             }
             onUpdateMastery(currentCard.id, known)
-            isFlipped = false
+            lastTransitionDir = if (known) 1 else -1
             hasBeenOpened = false
             if (currentIndex < currentBlockCards.size - 1) {
                 currentIndex++
@@ -258,7 +275,8 @@ fun FlashcardsScreen(
                             nextUnseenCursor = cursor
                             currentBlockNumber = 1
                             currentIndex = 0
-                            isFlipped = false
+                            stepFlipMap.clear()
+                            lastTransitionDir = 1
                             hasBeenOpened = false
                             historyStack.clear()
                         },
@@ -312,7 +330,6 @@ fun FlashcardsScreen(
             Spacer(modifier = Modifier.height(6.dp))
 
             if (currentBlockCards.isNotEmpty()) {
-                val activeCard = module.cards.find { it.id == currentBlockCards[currentIndex].id } ?: currentBlockCards[currentIndex]
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -320,20 +337,40 @@ fun FlashcardsScreen(
                         .padding(horizontal = 20.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    key("${currentBlockNumber}_${activeCard.id}") {
+                    AnimatedContent(
+                        targetState = currentStepKey,
+                        transitionSpec = {
+                            val dir = if (lastTransitionDir >= 0) 1 else -1
+                            (slideInHorizontally(animationSpec = tween(220)) { width -> width / 3 * dir } +
+                                fadeIn(animationSpec = tween(200)))
+                                .togetherWith(
+                                    slideOutHorizontally(animationSpec = tween(180)) { width -> -width / 4 * dir } +
+                                        fadeOut(animationSpec = tween(160))
+                                )
+                        },
+                        label = "flashcard_page_transition"
+                    ) { stepKey ->
+                        val parts = stepKey.split("_", limit = 3)
+                        val cardIdInStep = parts.getOrNull(2).orEmpty()
+                        val cardInStep = module.cards.find { it.id == cardIdInStep }
+                            ?: currentBlockCards.find { it.id == cardIdInStep }
+                            ?: currentBlockCards[currentIndex]
+                        val stepIsFlipped = stepFlipMap[stepKey] ?: false
                         FlashcardView(
-                            card = activeCard,
-                            isFlipped = isFlipped,
+                            card = cardInStep,
+                            isFlipped = stepIsFlipped,
                             onFlip = {
-                                isFlipped = !isFlipped
-                                if (isFlipped) {
+                                val nextState = !(stepFlipMap[stepKey] ?: false)
+                                stepFlipMap[stepKey] = nextState
+                                if (nextState) {
                                     hasBeenOpened = true
                                 }
                             },
                             onSwipeLeft = { handleCardDecision(false) },
                             onSwipeRight = { handleCardDecision(true) },
-                            onSpeak = speakText,
-                            onToggleStar = { onToggleStar(activeCard.id) }
+                            onSpeak = { text -> speakCardText(text) },
+                            onLongPressSpeak = { text -> ttsPickerTargetText = text },
+                            onToggleStar = { onToggleStar(cardInStep.id) }
                         )
                     }
                 }
@@ -373,8 +410,10 @@ fun FlashcardsScreen(
                     onClick = {
                         if (historyStack.isNotEmpty() && currentIndex > 0) {
                             val (prevCard, lastKnown) = historyStack.removeAt(historyStack.lastIndex)
+                            lastTransitionDir = -1
                             currentIndex--
-                            isFlipped = false
+                            val restoredKey = "${currentBlockNumber}_${currentIndex}_${prevCard.id}"
+                            stepFlipMap[restoredKey] = false
                             hasBeenOpened = false
                             if (lastKnown && knowCount > 0) knowCount--
                             if (!lastKnown && stillLearningCount > 0) {
@@ -474,7 +513,8 @@ fun FlashcardsScreen(
                             currentIndex = 0
                             knowCount = 0
                             stillLearningCount = 0
-                            isFlipped = false
+                            stepFlipMap.clear()
+                            lastTransitionDir = 1
                             showCompletionDialog = false
                         },
                         modifier = Modifier.testTag("repeat_unlearned_flashcards_btn")
@@ -500,7 +540,8 @@ fun FlashcardsScreen(
                             currentIndex = 0
                             knowCount = 0
                             stillLearningCount = 0
-                            isFlipped = false
+                            stepFlipMap.clear()
+                            lastTransitionDir = 1
                             showCompletionDialog = false
                         }
                     ) {
@@ -515,6 +556,26 @@ fun FlashcardsScreen(
                     Text("К модулю")
                 }
             }
+        )
+    }
+
+    val pickerText = ttsPickerTargetText
+    if (pickerText != null) {
+        com.example.quizapp.ui.components.TtsLanguagePickerSheet(
+            textToSpeak = pickerText,
+            ttsEngine = ttsEngine,
+            recentLanguageTags = recentTtsLanguages,
+            onSelectLanguage = { option ->
+                com.example.quizapp.ui.components.SmartTtsHelper.speakWithLocale(
+                    tts = ttsEngine,
+                    text = pickerText,
+                    targetLocale = option.locale
+                )
+                onAddRecentTtsLanguage(option.languageTag)
+                ttsPickerTargetText = null
+            },
+            onClearRecent = onClearRecentTtsLanguages,
+            onDismiss = { ttsPickerTargetText = null }
         )
     }
 }

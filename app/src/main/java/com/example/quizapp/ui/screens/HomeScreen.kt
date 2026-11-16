@@ -1,5 +1,6 @@
 package com.example.quizapp.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -75,9 +76,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.R
 import com.example.quizapp.data.locale.LocalStrings
 import com.example.quizapp.data.model.AppLanguage
 import com.example.quizapp.data.model.CardMasteryStatus
@@ -93,7 +96,7 @@ fun HomeScreen(
     onSelectLanguage: (AppLanguage) -> Unit,
     onOpenModule: (StudyModule) -> Unit,
     onOpenCreateModule: () -> Unit,
-    onOpenPhotoScanner: () -> Unit,
+    onOpenPhotoScanner: () -> Unit = {},
     onOpenImportExport: () -> Unit,
     onOpenAiTutor: () -> Unit,
     onOpenLibrary: (Int) -> Unit = {},
@@ -153,20 +156,14 @@ fun HomeScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Text(
-                                    text = "Q",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-                        }
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_app_logo),
+                            contentDescription = s.appName,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .testTag("home_app_logo")
+                        )
                         Text(
                             text = s.appName,
                             style = MaterialTheme.typography.titleLarge,
@@ -725,16 +722,6 @@ fun HomeScreen(
                         onOpenCreateModule()
                     },
                     testTag = "sheet_create_module"
-                )
-
-                CreateActionRow(
-                    icon = Icons.Default.CameraAlt,
-                    title = "Создать из фото",
-                    onClick = {
-                        showCreateBottomSheet = false
-                        onOpenPhotoScanner()
-                    },
-                    testTag = "sheet_scan_photo"
                 )
 
                 CreateActionRow(

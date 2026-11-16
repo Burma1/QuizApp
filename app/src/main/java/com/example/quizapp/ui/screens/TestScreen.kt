@@ -1,5 +1,8 @@
 package com.example.quizapp.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -11,17 +14,23 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -37,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,6 +58,7 @@ import com.example.quizapp.data.locale.LocalStrings
 import com.example.quizapp.data.model.Flashcard
 import com.example.quizapp.data.model.StudyModule
 import com.example.ui.theme.StatusMasteredDark
+import kotlinx.coroutines.launch
 
 data class TestQuestion(
     val card: Flashcard,
@@ -61,16 +72,20 @@ data class TestQuestion(
 @Composable
 fun TestScreen(
     module: StudyModule,
+    customCards: List<Flashcard>? = null,
     onBack: () -> Unit,
     onUpdateMastery: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val s = LocalStrings.current
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
     var isSubmitted by remember { mutableStateOf(false) }
     val userAnswers = remember { mutableStateMapOf<Int, String>() }
 
-    val questions = remember(module.id, module.cards.size) {
+    val questions = remember(module.id, module.cards.size, customCards?.size) {
         val allCards = module.cards
-        val testSubset = if (allCards.size > 50) allCards.take(50) else allCards
+        val targetCards = if (!customCards.isNullOrEmpty()) customCards else allCards
+        val testSubset = if (targetCards.size > 50) targetCards.take(50) else targetCards
         testSubset.mapIndexed { idx, card ->
             val isTf = idx % 2 == 0 && allCards.size > 1
             val showCorrectDef = idx % 3 != 0
@@ -119,6 +134,19 @@ fun TestScreen(
         }
     } else 0
 
+    val wrongQuestions = remember(isSubmitted, userAnswers) {
+        if (!isSubmitted) emptyList()
+        else questions.mapIndexed { idx, q ->
+            val currentAns = userAnswers[idx]
+            val isCorrect = if (q.isTrueFalse) {
+                (currentAns == "TRUE" && q.correctBool) || (currentAns == "FALSE" && !q.correctBool)
+            } else {
+                currentAns == q.card.definition
+            }
+            Triple(idx, q, isCorrect)
+        }.filter { !it.third }
+    }
+
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -148,9 +176,33 @@ fun TestScreen(
                     containerColor = MaterialTheme.colorScheme.background
                 )
             )
+        },
+        floatingActionButton = {
+            AnimatedVisibility(
+                visible = listState.firstVisibleItemIndex > 1,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                FloatingActionButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            listState.animateScrollToItem(0)
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.testTag("fab_scroll_top")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ArrowUpward,
+                        contentDescription = "В начало теста"
+                    )
+                }
+            }
         }
     ) { innerPadding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
@@ -158,7 +210,7 @@ fun TestScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             if (isSubmitted) {
-                item {
+                item(key = "result_card") {
                     val pct = if (questions.isEmpty()) 100 else (scoreCount * 100) / questions.size
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -195,9 +247,200 @@ fun TestScreen(
                         }
                     }
                 }
+
+                // Dedicated section: Cards with incorrect answers right below the result card
+                if (wrongQuestions.isNotEmpty()) {
+                    item(key = "wrong_answers_banner") {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(20.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+                            ),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.6f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(16.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Cancel,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column {
+                                    Text(
+                                        text = "Ошибки в тесте (${wrongQuestions.size})",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Text(
+                                        text = "Карточки с неверным ответом для повторения:",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.85f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    items(wrongQuestions, key = { "wrong_${it.first}_${it.second.card.id}" }) { (idx, q, _) ->
+                        val userAns = userAnswers[idx] ?: "Ответ не выбран"
+                        val correctAnsText = if (q.isTrueFalse) {
+                            if (q.correctBool) s.trueLabel else s.falseLabel
+                        } else {
+                            q.card.definition
+                        }
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                            ),
+                            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.error)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.errorContainer
+                                    ) {
+                                        Text(
+                                            text = "Вопрос #${idx + 1} • Неверно",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onErrorContainer,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.Default.Cancel,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                }
+
+                                Text(
+                                    text = q.card.term,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+
+                                if (q.isTrueFalse) {
+                                    Text(
+                                        text = "Утверждение: ${q.displayedDefinition}",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Ваш ответ: ",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                        Text(
+                                            text = if (q.isTrueFalse) {
+                                                if (userAns == "TRUE") s.trueLabel else if (userAns == "FALSE") s.falseLabel else userAns
+                                            } else userAns,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = StatusMasteredDark.copy(alpha = 0.12f),
+                                    border = BorderStroke(1.dp, StatusMasteredDark.copy(alpha = 0.4f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Правильно: ",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = StatusMasteredDark
+                                        )
+                                        Text(
+                                            text = correctAnsText,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    item(key = "all_correct_banner") {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = StatusMasteredDark.copy(alpha = 0.15f)
+                            ),
+                            border = BorderStroke(1.dp, StatusMasteredDark.copy(alpha = 0.5f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = null,
+                                    tint = StatusMasteredDark,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "Великолепно! Все ответы правильные, ошибок нет.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item(key = "all_questions_header") {
+                    Text(
+                        text = "Все вопросы теста (${questions.size}):",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
             }
 
-            itemsIndexed(questions) { idx, q ->
+            itemsIndexed(questions, key = { idx, q -> "q_${idx}_${q.card.id}" }) { idx, q ->
                 val currentAns = userAnswers[idx]
                 val isCorrect = if (q.isTrueFalse) {
                     (currentAns == "TRUE" && q.correctBool) || (currentAns == "FALSE" && !q.correctBool)
@@ -334,52 +577,60 @@ fun TestScreen(
                 }
             }
 
-            item {
-                if (!isSubmitted) {
-                    Button(
-                        onClick = {
-                            isSubmitted = true
-                            questions.forEachIndexed { idx, q ->
-                                val ans = userAnswers[idx]
-                                val correct = if (q.isTrueFalse) {
-                                    (ans == "TRUE" && q.correctBool) || (ans == "FALSE" && !q.correctBool)
-                                } else {
-                                    ans == q.card.definition
+            item(key = "test_bottom_actions") {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    if (!isSubmitted) {
+                        Button(
+                            onClick = {
+                                isSubmitted = true
+                                questions.forEachIndexed { idx, q ->
+                                    val ans = userAnswers[idx]
+                                    val correct = if (q.isTrueFalse) {
+                                        (ans == "TRUE" && q.correctBool) || (ans == "FALSE" && !q.correctBool)
+                                    } else {
+                                        ans == q.card.definition
+                                    }
+                                    onUpdateMastery(q.card.id, correct)
                                 }
-                                onUpdateMastery(q.card.id, correct)
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(54.dp)
-                            .testTag("submit_test_button"),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text(
-                            text = s.submitTest,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                } else {
-                    Button(
-                        onClick = {
-                            userAnswers.clear()
-                            isSubmitted = false
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(54.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text(
-                            text = s.restartBtn,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold
-                        )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(54.dp)
+                                .testTag("submit_test_button"),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Text(
+                                text = s.submitTest,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                userAnswers.clear()
+                                isSubmitted = false
+                                coroutineScope.launch {
+                                    listState.animateScrollToItem(0)
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(54.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Text(
+                                text = s.restartBtn,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(32.dp))
             }
         }
     }

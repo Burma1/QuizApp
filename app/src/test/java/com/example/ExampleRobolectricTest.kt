@@ -12,6 +12,7 @@ import com.example.quizapp.data.model.Flashcard
 import com.example.quizapp.data.model.LearnStudyGoal
 import com.example.quizapp.data.model.StudyModule
 import com.example.quizapp.data.repository.QuizRepository
+import com.example.quizapp.ui.components.SmartTtsHelper
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -45,22 +46,46 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `SmartTtsHelper detects English, Russian, and Spanish locales and splits mixed definitions`() {
-        val enLocale = com.example.quizapp.ui.components.SmartTtsHelper.detectLocaleForText("Break the ice")
+    fun `SmartTtsHelper detects alphabets deterministically and falls back basic Latin to English`() {
+        val enLocale = SmartTtsHelper.detectLocaleForText("Break the ice")
         assertEquals("en", enLocale.language)
 
-        val ruLocale = com.example.quizapp.ui.components.SmartTtsHelper.detectLocaleForText("Разрядить обстановку")
+        val ruLocale = SmartTtsHelper.detectLocaleForText("Разрядить обстановку")
         assertEquals("ru", ruLocale.language)
 
-        val esLocale = com.example.quizapp.ui.components.SmartTtsHelper.detectLocaleForText("¡Buenos días! ¿Qué tal?")
-        assertEquals("es", esLocale.language)
+        // Unique Spanish characters -> Spanish ("es")
+        val esLocaleAccented = SmartTtsHelper.detectLocaleForText("¡Buenos días! ¿Qué tal?")
+        assertEquals("es", esLocaleAccented.language)
 
-        val segments = com.example.quizapp.ui.components.SmartTtsHelper.splitIntoLanguageSegments(
+        // Pure basic Latin (a-z) is ALWAYS English ("en"), never Spanish accent!
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("Bailando en la noche").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("Color").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("Despacito").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("Mirada").language)
+
+        val segments = SmartTtsHelper.splitIntoLanguageSegments(
             "Разрядить обстановку (To make people feel more comfortable)."
         )
         assertEquals(2, segments.size)
         assertEquals("ru", segments[0].locale.language)
         assertEquals("en", segments[1].locale.language)
+
+        // Arabic ("ar")
+        assertEquals("ar", SmartTtsHelper.detectLocaleForText("السلام عليكم ورحمة الله").language)
+        assertEquals("ar", SmartTtsHelper.detectLocaleForText("مرحبا بك").language)
+
+        // Portuguese ("pt") - unique ã / õ
+        assertEquals("pt", SmartTtsHelper.detectLocaleForText("Não tenho coração").language)
+
+        // French ("fr") - unique French letters/diacritics
+        assertEquals("fr", SmartTtsHelper.detectLocaleForText("J'aime beaucoup cette chanson française").language)
+
+        // German ("de") - unique umlauts/Eszett
+        assertEquals("de", SmartTtsHelper.detectLocaleForText("Ich möchte Deutsch lernen").language)
+
+        // Kazakh ("kk") - unique Kazakh Cyrillic letters
+        assertEquals("kk", SmartTtsHelper.detectLocaleForText("Сәлеметсіз бе, қалайсың?").language)
+        assertEquals("kk", SmartTtsHelper.detectLocaleForText("Қайырлы таң достар").language)
     }
 
     @Test
@@ -276,5 +301,272 @@ class ExampleRobolectricTest {
         quizRepo.deleteModule(createdMod.id)
         assertEquals(initialModuleCount, quizRepo.modules.value.size)
     }
+
+    @Test
+    fun `Adding editing and deleting terms in custom and seed modules persists across repository reloads`() {
+        val repo1 = QuizRepository(context)
+        val seedId = repo1.modules.value.first { it.id.startsWith("seed_") }.id
+        val initialSeedCount = repo1.modules.value.first { it.id == seedId }.cards.size
+
+        // Add term to seed module
+        repo1.addCardToModule(seedId, "Break a leg", "Ни пуха ни пера", "Break a leg on stage!")
+        val addedCard = repo1.modules.value.first { it.id == seedId }.cards.last()
+        assertEquals("Break a leg", addedCard.term)
+        assertEquals(initialSeedCount + 1, repo1.modules.value.first { it.id == seedId }.cards.size)
+
+        // Update term
+        repo1.updateCardInModule(seedId, addedCard.id, "Break a leg!", "Удачи!", "Break a leg tonight!")
+        val updatedCard = repo1.modules.value.first { it.id == seedId }.cards.first { it.id == addedCard.id }
+        assertEquals("Break a leg!", updatedCard.term)
+        assertEquals("Удачи!", updatedCard.definition)
+
+        // Reload repository from SharedPreferences and verify persistence
+        val repo2 = QuizRepository(context)
+        val reloadedMod = repo2.modules.value.first { it.id == seedId }
+        assertEquals(initialSeedCount + 1, reloadedMod.cards.size)
+        assertEquals("Удачи!", reloadedMod.cards.first { it.id == addedCard.id }.definition)
+
+        // Delete term
+        repo2.deleteCardFromModule(seedId, addedCard.id)
+        val repo3 = QuizRepository(context)
+        assertEquals(initialSeedCount, repo3.modules.value.first { it.id == seedId }.cards.size)
+    }
+
+    @Test
+    fun `Imported module appears before seed modules and exports cleanly to JSON and CSV`() {
+        val repo = QuizRepository(context)
+        val imported = repo.importModuleFromTextOrCsv(
+            rawText = "\uFEFFЗоология — наука о животных\nЭтология – наука о поведении\nИхтиология - наука о рыбах",
+            defaultTitle = "Зоология 7 класс"
+        ).copy(category = "Биология")
+        repo.saveModule(imported)
+
+        // Imported/custom modules appear first so export selector always shows them cleanly
+        val firstMod = repo.modules.value.first()
+        assertEquals("Зоология 7 класс", firstMod.title)
+        assertEquals("Биология", firstMod.category)
+        assertEquals(3, firstMod.cards.size)
+
+        val json = repo.exportModuleToJson(firstMod)
+        assertTrue(json.contains("Зоология 7 класс"))
+        assertTrue(json.contains("Ихтиология"))
+
+        val csv = repo.exportModuleToCsv(firstMod)
+        assertTrue(csv.contains("# Зоология 7 класс"))
+        assertTrue(csv.contains("Этология\tнаука о поведении"))
+    }
+
+    @Test
+    fun `AI action tag creates and updates modules cleanly and removes service tags`() {
+        val repo = QuizRepository(context)
+        val aiClient = AiClient()
+
+        // 1. Ensure prose with colons doesn't produce garbage fragments like "скелеты).Ш..."
+        val messyProse = """
+            Бывает, классика жанра перед концом четверти.
+            По оглавлению до 6-го параграфа у нас база: § 1. Зоология как наука.
+            Вопрос на проверку: Если учёный наблюдает, как стая волков охотится?
+            [Program finished]
+        """.trimIndent()
+        val parsedProse = aiClient.parseFlashcardsFromJsonOrText(messyProse, "tmp")
+        assertTrue("Prose sentences must not produce broken flashcards", parsedProse.isEmpty())
+
+        // 2. Execute <quizapp_action> create_module
+        val aiResponseCreate = """
+            Готово! Я разобрал конспект по зоологии и создал 3 карточки.
+            [Program finished]
+            <quizapp_action>
+            {"action":"create_module","title":"Зоология §1","category":"Биология","cards":[
+              {"term":"Зоология","definition":"Наука о животных: их строении, поведении и развитии."},
+              {"term":"Этология","definition":"Раздел зоологии, изучающий поведение животных."},
+              {"term":"Ихтиология","definition":"Раздел зоологии, изучающий рыб."}
+            ]}
+            </quizapp_action>
+        """.trimIndent()
+
+        val processedCreate = repo.processAiActionResponse(aiResponseCreate, "создай карточки по зоологии")
+        assertFalse(processedCreate.visibleText.contains("quizapp_action"))
+        assertFalse(processedCreate.visibleText.contains("[Program finished]"))
+        assertNotNull(processedCreate.createdModuleId)
+        assertEquals("Зоология §1", processedCreate.createdModuleTitle)
+        assertEquals(3, processedCreate.suggestedCards.size)
+
+        val createdId = processedCreate.createdModuleId!!
+        val storedMod = repo.modules.value.first { it.id == createdId }
+        assertEquals(3, storedMod.cards.size)
+
+        // 3. Execute <quizapp_action> add_cards to the created module
+        val aiResponseAdd = """
+            Добавил ещё одну карточку в модуль «Зоология §1».
+            <quizapp_action>
+            {"action":"add_cards","module_id":"$createdId","cards":[
+              {"term":"Бионика","definition":"Использование природных инженерных решений в технике."}
+            ]}
+            </quizapp_action>
+        """.trimIndent()
+        val processedAdd = repo.processAiActionResponse(aiResponseAdd, "добавь бионику")
+        assertEquals(createdId, processedAdd.createdModuleId)
+        assertEquals(4, repo.modules.value.first { it.id == createdId }.cards.size)
+    }
+
+    @Test
+    fun `Full database export and import preserves custom cards progress needsReview learning mastered starred and folder order`() {
+        val repo1 = QuizRepository(context)
+
+        // 1. Create custom folders and custom module
+        repo1.createFolder("Экзамен Биология")
+        repo1.createFolder("IT Собеседование")
+        val customMod = StudyModule(
+            id = "custom_bio_1",
+            title = "Клеточная биология",
+            description = "Органеллы клетки",
+            category = "Экзамен Биология",
+            cards = listOf(
+                Flashcard(id = "cb_1", moduleId = "custom_bio_1", term = "Митохондрия", definition = "Энергетическая станция клетки"),
+                Flashcard(id = "cb_2", moduleId = "custom_bio_1", term = "Рибосома", definition = "Органелла синтеза белка"),
+                Flashcard(id = "cb_3", moduleId = "custom_bio_1", term = "Лизосома", definition = "Внутриклеточное пищеварение")
+            )
+        )
+        repo1.saveModule(customMod)
+
+        // 2. Set different mastery statuses:
+        // cb_1 -> MASTERED (2x known) + Starred
+        repo1.updateCardMastery("custom_bio_1", "cb_1", isKnown = true)
+        repo1.updateCardMastery("custom_bio_1", "cb_1", isKnown = true)
+        repo1.toggleCardStarred("custom_bio_1", "cb_1")
+
+        // cb_2 -> LEARNING (1x known)
+        repo1.updateCardMastery("custom_bio_1", "cb_2", isKnown = true)
+
+        // cb_3 -> needsReview (missed) + Starred
+        repo1.updateCardMastery("custom_bio_1", "cb_3", isKnown = false)
+        repo1.toggleCardStarred("custom_bio_1", "cb_3")
+
+        // Also star and mark progress on a seed module card
+        val seedMod = repo1.modules.value.first { it.id.startsWith("seed_") }
+        val seedCardId = seedMod.cards.first().id
+        repo1.updateCardMastery(seedMod.id, seedCardId, isKnown = true)
+        repo1.toggleCardStarred(seedMod.id, seedCardId)
+
+        // 3. Reorder folders and rename a folder
+        repo1.renameFolder("IT Собеседование", "Архитектура ПО")
+        repo1.setFolderOrder(listOf("Экзамен Биология", "Архитектура ПО", "Английский язык", "Общее"))
+
+        // 4. Export full database JSON
+        val exportedJson = repo1.exportFullDatabaseToJson()
+        assertTrue(exportedJson.contains("quizapp_full_db_v2"))
+        assertTrue(exportedJson.contains("Клеточная биология"))
+        assertTrue(exportedJson.contains("Экзамен Биология"))
+
+        // 5. Wipe SharedPreferences completely and restore into a fresh repository
+        context.getSharedPreferences("quizapp_prefs", Context.MODE_PRIVATE).edit().clear().commit()
+        val repoFresh = QuizRepository(context)
+        assertFalse(repoFresh.modules.value.any { it.id == "custom_bio_1" })
+
+        val restoreResult = repoFresh.importFullDatabaseFromJson(exportedJson, replaceExisting = true)
+        assertTrue("Full DB restore must succeed", restoreResult.isSuccess)
+        val summary = restoreResult.getOrThrow()
+        assertEquals(1, summary.customModulesCount)
+        assertEquals(1, summary.masteredCards)
+        assertEquals(2, summary.learningCards)
+        assertEquals(1, summary.needsReviewCards)
+        assertEquals(3, summary.starredCards)
+
+        // 6. Verify restored state across a brand-new repository reload
+        val repoReloaded = QuizRepository(context)
+        val restoredBio = repoReloaded.modules.value.first { it.id == "custom_bio_1" }
+        assertEquals("Экзамен Биология", restoredBio.category)
+
+        val c1 = restoredBio.cards.first { it.id == "cb_1" }
+        val c2 = restoredBio.cards.first { it.id == "cb_2" }
+        val c3 = restoredBio.cards.first { it.id == "cb_3" }
+
+        assertEquals(CardMasteryStatus.MASTERED, c1.status)
+        assertTrue(c1.isStarred)
+
+        assertEquals(CardMasteryStatus.LEARNING, c2.status)
+        assertFalse(c2.isStarred)
+
+        assertTrue(c3.needsReview)
+        assertTrue(c3.isStarred)
+
+        // Verify folder order was preserved
+        assertEquals("Экзамен Биология", repoReloaded.folderOrder.value.first())
+        assertTrue(repoReloaded.customFolders.value.contains("Архитектура ПО"))
+    }
+
+    @Test
+    fun `CreateModule AI generation extracts flashcards from attached file text`() = runTest {
+        val repo = QuizRepository(context)
+        val attachment = com.example.quizapp.data.model.ChatAttachment(
+            id = "att_1",
+            name = "biology_notes.txt",
+            mimeType = "text/plain",
+            type = com.example.quizapp.data.model.ChatAttachmentType.FILE,
+            extractedText = "Фотосинтез — процесс образования органических веществ на свету\nХлорофилл — зелёный пигмент растений\nМитоз — непрямое деление клетки"
+        )
+        val generated = repo.generateFlashcardsForTopic(
+            topic = "",
+            attachments = listOf(attachment)
+        )
+        assertEquals(3, generated.size)
+        assertEquals("Фотосинтез", generated[0].term)
+        assertEquals("Хлорофилл", generated[1].term)
+        assertEquals("Митоз", generated[2].term)
+    }
+
+    @Test
+    fun `SmartTtsHelper uses strict letter-based detection and QuizRepository stores and clears recent TTS languages`() {
+        // 1. Any basic Latin a-z text is strictly English (never Spanish accent on English words)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("I'm coming").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("camera").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("solo").language)
+        assertEquals("en", SmartTtsHelper.detectLocaleForText("hola").language)
+        assertEquals(
+            "en",
+            SmartTtsHelper.detectLocaleForText("I'm coming", SmartTtsHelper.spanishLocale).language
+        )
+
+        // 2. Unique non-English letters identify their language accurately
+        assertEquals("ru", SmartTtsHelper.detectLocaleForText("Первое").language)
+        assertEquals("kk", SmartTtsHelper.detectLocaleForText("Сәлем, қалың қалай?").language)
+        assertEquals("ar", SmartTtsHelper.detectLocaleForText("مرحبا كيف حالك").language)
+        assertEquals("es", SmartTtsHelper.detectLocaleForText("España — ¿Qué tal?").language)
+        assertEquals("pt", SmartTtsHelper.detectLocaleForText("coração não").language)
+        assertEquals("fr", SmartTtsHelper.detectLocaleForText("Cœur et lumière").language)
+        assertEquals("de", SmartTtsHelper.detectLocaleForText("Straße und Größe").language)
+
+        // 3. Multi-alphabet splitting across Cyrillic / basic Latin / unique Spanish
+        val segments = SmartTtsHelper.splitIntoLanguageSegments("Первое: I'm coming — ¿Qué tal?")
+        assertEquals(3, segments.size)
+        assertEquals("Первое", segments[0].text)
+        assertEquals("ru", segments[0].locale.language)
+        assertEquals("I'm coming", segments[1].text)
+        assertEquals("en", segments[1].locale.language)
+        assertEquals("¿Qué tal?", segments[2].text)
+        assertEquals("es", segments[2].locale.language)
+
+        // 4. Repository persistence for Recently Used TTS languages and Trash clear action
+        val repo = QuizRepository(context)
+        assertTrue(repo.recentTtsLanguages.value.isEmpty())
+
+        repo.addRecentTtsLanguage("es-ES")
+        repo.addRecentTtsLanguage("de-DE")
+        repo.addRecentTtsLanguage("es-ES") // Moves to front without duplicates
+        assertEquals(listOf("es-ES", "de-DE"), repo.recentTtsLanguages.value)
+
+        // Survives repository reload
+        val repoReloaded = QuizRepository(context)
+        assertEquals(listOf("es-ES", "de-DE"), repoReloaded.recentTtsLanguages.value)
+
+        // Clear removes all recent entries persistently
+        repoReloaded.clearRecentTtsLanguages()
+        assertTrue(repoReloaded.recentTtsLanguages.value.isEmpty())
+        val repoAfterClear = QuizRepository(context)
+        assertTrue(repoAfterClear.recentTtsLanguages.value.isEmpty())
+    }
 }
+
+
+
 

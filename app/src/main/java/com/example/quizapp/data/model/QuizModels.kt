@@ -172,6 +172,7 @@ data class StudyModule(
     val learningCount: Int = cards.count { it.status == CardMasteryStatus.LEARNING }
     val masteredCount: Int = cards.count { it.status == CardMasteryStatus.MASTERED }
     val needsReviewCount: Int = cards.count { it.needsReview || it.status == CardMasteryStatus.LEARNING }
+    val starredCount: Int = cards.count { it.isStarred }
     val completionPercent: Int = if (cards.isEmpty()) 0 else {
         val totalPoints = cards.size * 2
         val earnedPoints = cards.sumOf {
@@ -185,11 +186,39 @@ data class StudyModule(
     }
 }
 
+data class DatabaseRestoreResult(
+    val totalModules: Int,
+    val customModulesCount: Int,
+    val totalCards: Int,
+    val masteredCards: Int,
+    val learningCards: Int,
+    val needsReviewCards: Int,
+    val starredCards: Int,
+    val foldersCount: Int
+)
+
 data class UserStudyStats(
     val streakDays: Int = 1,
     val dailyGoal: Int = 20,
     val todayStudied: Int = 0,
     val totalCardsLearned: Int = 0
+)
+
+enum class ChatAttachmentType {
+    IMAGE,
+    FILE
+}
+
+data class ChatAttachment(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val name: String,
+    val mimeType: String,
+    val type: ChatAttachmentType,
+    val uriString: String? = null,
+    val base64Data: String? = null,
+    val pdfPageImagesBase64: List<String> = emptyList(),
+    val extractedText: String? = null,
+    val sizeBytes: Long = 0L
 )
 
 data class ChatMessage(
@@ -200,7 +229,8 @@ data class ChatMessage(
     val isGenerating: Boolean = false,
     val suggestedCards: List<Pair<String, String>> = emptyList(),
     val createdModuleId: String? = null,
-    val createdModuleTitle: String? = null
+    val createdModuleTitle: String? = null,
+    val attachments: List<ChatAttachment> = emptyList()
 )
 
 data class MagicNotesResult(

@@ -1,10 +1,12 @@
 package com.example.quizapp.ui.screens
 
 import android.speech.tts.TextToSpeech
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,8 +30,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Assignment
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.School
@@ -39,15 +43,19 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Style
 import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.outlined.StarBorder
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -67,6 +75,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -89,18 +98,31 @@ fun ModuleDetailScreen(
     onBack: () -> Unit,
     onOpenFlashcards: (List<Flashcard>?) -> Unit,
     onOpenLearn: (List<Flashcard>?) -> Unit,
-    onOpenTest: () -> Unit,
+    onOpenTest: (List<Flashcard>?) -> Unit,
     onOpenExport: () -> Unit = {},
     onToggleStar: (String) -> Unit = {},
-    onDeleteModule: () -> Unit = {}
+    onDeleteModule: () -> Unit = {},
+    onAddCard: (term: String, definition: String, example: String?) -> Unit = { _, _, _ -> },
+    onUpdateCard: (cardId: String, term: String, definition: String, example: String?) -> Unit = { _, _, _, _ -> },
+    onDeleteCard: (cardId: String) -> Unit = {},
+    onUpdateModuleInfo: (title: String, description: String, category: String) -> Unit = { _, _, _ -> },
+    recentTtsLanguages: List<String> = emptyList(),
+    onAddRecentTtsLanguage: (String) -> Unit = {},
+    onClearRecentTtsLanguages: () -> Unit = {}
 ) {
     val s = LocalStrings.current
     val context = LocalContext.current
     var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    var ttsPickerTargetText by remember { mutableStateOf<String?>(null) }
 
-    // 0: All, 1: Not Studied, 2: Learning, 3: Mastered
+    // 0: All, 1: Not Studied, 2: Learning, 3: Mastered, 4: Starred
     var selectedFilter by remember { mutableIntStateOf(0) }
     var sortByStatus by remember { mutableStateOf(false) }
+
+    // Dialog states
+    var showAddTermDialog by remember { mutableStateOf(false) }
+    var editingCard by remember { mutableStateOf<Flashcard?>(null) }
+    var showEditModuleDialog by remember { mutableStateOf(false) }
 
     DisposableEffect(context) {
         var engine: TextToSpeech? = null
@@ -118,12 +140,14 @@ fun ModuleDetailScreen(
 
     val previewCards = remember(module.cards) { module.cards.take(8) }
     val pagerState = rememberPagerState(pageCount = { previewCards.size.coerceAtLeast(1) })
+    val starredCards = remember(module.cards) { module.cards.filter { it.isStarred } }
 
     val filteredCards = remember(module.cards, selectedFilter, sortByStatus) {
         val base = when (selectedFilter) {
             1 -> module.cards.filter { it.status == CardMasteryStatus.NOT_STUDIED }
             2 -> module.cards.filter { it.status == CardMasteryStatus.LEARNING }
             3 -> module.cards.filter { it.status == CardMasteryStatus.MASTERED }
+            4 -> module.cards.filter { it.isStarred }
             else -> module.cards
         }
         if (sortByStatus) {
@@ -155,6 +179,16 @@ fun ModuleDetailScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { showAddTermDialog = true },
+                        modifier = Modifier.testTag("topbar_add_term_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Добавить термин",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     IconButton(
                         onClick = onOpenExport,
                         modifier = Modifier.testTag("export_module_button")
@@ -194,7 +228,12 @@ fun ModuleDetailScreen(
                                 .height(200.dp)
                         ) { page ->
                             val card = previewCards[page]
-                            var flipped by remember { mutableStateOf(false) }
+                            var flipped by remember(card.id) { mutableStateOf(false) }
+                            val flipRotation by animateFloatAsState(
+                                targetValue = if (flipped) 180f else 0f,
+                                animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+                                label = "previewCardFlip"
+                            )
 
                             ElevatedCard(
                                 onClick = { flipped = !flipped },
@@ -205,15 +244,42 @@ fun ModuleDetailScreen(
                                 elevation = CardDefaults.elevatedCardElevation(defaultElevation = 3.dp),
                                 modifier = Modifier
                                     .fillMaxSize()
+                                    .graphicsLayer {
+                                        rotationY = flipRotation
+                                        cameraDistance = 12f * density
+                                    }
                                     .testTag("preview_card_$page")
                             ) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
+                                        .graphicsLayer {
+                                            if (flipRotation > 90f) rotationY = 180f
+                                        }
                                         .padding(24.dp)
                                 ) {
+                                    val isShowingTerm = flipRotation <= 90f
+                                    val displayedText = if (isShowingTerm) card.term else card.definition
+
+                                    com.example.quizapp.ui.components.TtsSpeakButton(
+                                        onClick = {
+                                            com.example.quizapp.ui.components.SmartTtsHelper.speakSmart(
+                                                ttsEngine,
+                                                displayedText
+                                            )
+                                        },
+                                        onLongClick = {
+                                            ttsPickerTargetText = displayedText
+                                        },
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        contentDescriptionText = "Speak",
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .testTag("preview_card_tts_$page")
+                                    )
+
                                     Text(
-                                        text = if (flipped) card.definition else card.term,
+                                        text = displayedText,
                                         style = MaterialTheme.typography.titleLarge,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onSurface,
@@ -269,14 +335,33 @@ fun ModuleDetailScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = module.title,
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = module.title,
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            IconButton(
+                                onClick = { showEditModuleDialog = true },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .testTag("edit_module_info_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Edit,
+                                    contentDescription = "Редактировать модуль",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             onClick = onDeleteModule,
                             shape = RoundedCornerShape(12.dp),
@@ -347,7 +432,7 @@ fun ModuleDetailScreen(
                 }
             }
 
-            // 3. Educational Study Modes ONLY (Карточки, Заучивание, Тест — NO games)
+            // 3. Educational Study Modes ONLY
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     StudyModeMd3Row(
@@ -365,13 +450,104 @@ fun ModuleDetailScreen(
                     StudyModeMd3Row(
                         icon = Icons.Default.Assignment,
                         title = s.testMode,
-                        onClick = onOpenTest,
+                        onClick = { onOpenTest(null) },
                         testTag = "mode_test_button"
                     )
+
+                    if (starredCards.isNotEmpty()) {
+                        OutlinedCard(
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = StatusLearningDark.copy(alpha = 0.08f)
+                            ),
+                            border = BorderStroke(1.dp, StatusLearningDark.copy(alpha = 0.35f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("starred_practice_card")
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Star,
+                                        contentDescription = null,
+                                        tint = StatusLearningDark,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = "Учить отмеченные (${starredCards.size})",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    FilledTonalButton(
+                                        onClick = { onOpenFlashcards(starredCards) },
+                                        shape = RoundedCornerShape(12.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("starred_flashcards_btn")
+                                    ) {
+                                        Text(
+                                            text = s.flashcardsMode,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = { onOpenLearn(starredCards) },
+                                        shape = RoundedCornerShape(12.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("starred_learn_btn")
+                                    ) {
+                                        Text(
+                                            text = s.learnMode,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = { onOpenTest(starredCards) },
+                                        shape = RoundedCornerShape(12.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("starred_test_btn")
+                                    ) {
+                                        Text(
+                                            text = s.testMode,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            // 4. "Ваш прогресс" Section (matching reference screenshot concept in pure MD3)
+            // 4. "Ваш прогресс" Section
             item {
                 Column(
                     modifier = Modifier
@@ -393,7 +569,6 @@ fun ModuleDetailScreen(
 
                     val totalCount = module.cards.size.coerceAtLeast(1)
 
-                    // Row 1: Не изучено
                     MasteryProgressRowCard(
                         count = module.notStudiedCount,
                         total = totalCount,
@@ -411,7 +586,6 @@ fun ModuleDetailScreen(
                         testTag = "progress_row_not_studied"
                     )
 
-                    // Row 2: Изучено
                     MasteryProgressRowCard(
                         count = module.learningCount,
                         total = totalCount,
@@ -429,7 +603,6 @@ fun ModuleDetailScreen(
                         testTag = "progress_row_learning"
                     )
 
-                    // Row 3: Усвоено
                     MasteryProgressRowCard(
                         count = module.masteredCount,
                         total = totalCount,
@@ -442,7 +615,6 @@ fun ModuleDetailScreen(
                         testTag = "progress_row_mastered"
                     )
 
-                    // Quick button to study unlearned / review terms if any
                     if (unmasteredCards.isNotEmpty() && (module.learningCount > 0 || module.needsReviewCount > 0)) {
                         Button(
                             onClick = { onOpenLearn(unmasteredCards) },
@@ -466,13 +638,13 @@ fun ModuleDetailScreen(
                 }
             }
 
-            // 5. "Термины" Header + Filter Chips + Sort
+            // 5. "Термины" Header + Prominent Add Term Button + Filter Chips + Sort
             item {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -506,11 +678,33 @@ fun ModuleDetailScreen(
                         }
                     }
 
+                    // Prominent button to add a new term directly in this module
+                    FilledTonalButton(
+                        onClick = { showAddTermDialog = true },
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("add_term_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Добавить термин в модуль",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         val chips = listOf(
                             0 to "${s.allTermsTab} (${module.cards.size})",
+                            4 to "⭐ Избранные (${starredCards.size})",
                             1 to "${s.notStudiedLabel} (${module.notStudiedCount})",
                             2 to "${s.learningLabel} (${module.learningCount})",
                             3 to "${s.masteredLabel} (${module.masteredCount})"
@@ -533,17 +727,46 @@ fun ModuleDetailScreen(
             }
 
             // 6. Terms Cards List
-            items(filteredCards, key = { it.id }) { card ->
-                TermItemMd3Card(
-                    card = card,
-                    onSpeak = {
-                        com.example.quizapp.ui.components.SmartTtsHelper.speakSmart(
-                            ttsEngine,
-                            "${card.term} — ${card.definition}"
-                        )
-                    },
-                    onToggleStar = { onToggleStar(card.id) }
-                )
+            if (filteredCards.isEmpty()) {
+                item {
+                    OutlinedCard(
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = if (module.cards.isEmpty()) "В этом модуле пока нет терминов" else "Нет терминов с выбранным фильтром",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+            } else {
+                items(filteredCards, key = { it.id }) { card ->
+                    val fullPhrase = "${card.term} — ${card.definition}"
+                    TermItemMd3Card(
+                        card = card,
+                        onSpeak = {
+                            com.example.quizapp.ui.components.SmartTtsHelper.speakSmart(
+                                ttsEngine,
+                                fullPhrase
+                            )
+                        },
+                        onLongPressSpeak = {
+                            ttsPickerTargetText = fullPhrase
+                        },
+                        onToggleStar = { onToggleStar(card.id) },
+                        onEdit = { editingCard = card }
+                    )
+                }
             }
 
             item {
@@ -551,6 +774,211 @@ fun ModuleDetailScreen(
             }
         }
     }
+
+    // Add Term Dialog
+    if (showAddTermDialog) {
+        TermEditorDialog(
+            title = "Новый термин",
+            initialTerm = "",
+            initialDefinition = "",
+            initialExample = "",
+            onDismiss = { showAddTermDialog = false },
+            onSave = { term, def, ex ->
+                onAddCard(term, def, ex)
+                showAddTermDialog = false
+            }
+        )
+    }
+
+    // Edit Existing Term Dialog
+    editingCard?.let { cardToEdit ->
+        TermEditorDialog(
+            title = "Редактировать термин",
+            initialTerm = cardToEdit.term,
+            initialDefinition = cardToEdit.definition,
+            initialExample = cardToEdit.exampleSentence.orEmpty(),
+            onDismiss = { editingCard = null },
+            onSave = { term, def, ex ->
+                onUpdateCard(cardToEdit.id, term, def, ex)
+                editingCard = null
+            },
+            onDelete = {
+                onDeleteCard(cardToEdit.id)
+                editingCard = null
+            }
+        )
+    }
+
+    // Edit Module Info Dialog
+    if (showEditModuleDialog) {
+        ModuleInfoEditorDialog(
+            initialTitle = module.title,
+            initialDescription = module.description,
+            initialCategory = module.category,
+            onDismiss = { showEditModuleDialog = false },
+            onSave = { newTitle, newDesc, newCat ->
+                onUpdateModuleInfo(newTitle, newDesc, newCat)
+                showEditModuleDialog = false
+            }
+        )
+    }
+
+    val pickerText = ttsPickerTargetText
+    if (pickerText != null) {
+        com.example.quizapp.ui.components.TtsLanguagePickerSheet(
+            textToSpeak = pickerText,
+            ttsEngine = ttsEngine,
+            recentLanguageTags = recentTtsLanguages,
+            onSelectLanguage = { option ->
+                com.example.quizapp.ui.components.SmartTtsHelper.speakWithLocale(
+                    tts = ttsEngine,
+                    text = pickerText,
+                    targetLocale = option.locale
+                )
+                onAddRecentTtsLanguage(option.languageTag)
+                ttsPickerTargetText = null
+            },
+            onClearRecent = onClearRecentTtsLanguages,
+            onDismiss = { ttsPickerTargetText = null }
+        )
+    }
+}
+
+@Composable
+private fun TermEditorDialog(
+    title: String,
+    initialTerm: String,
+    initialDefinition: String,
+    initialExample: String,
+    onDismiss: () -> Unit,
+    onSave: (term: String, definition: String, example: String?) -> Unit,
+    onDelete: (() -> Unit)? = null
+) {
+    var termText by remember(initialTerm) { mutableStateOf(initialTerm) }
+    var defText by remember(initialDefinition) { mutableStateOf(initialDefinition) }
+    var exampleText by remember(initialExample) { mutableStateOf(initialExample) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(text = title, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = termText,
+                    onValueChange = { termText = it },
+                    label = { Text("Термин") },
+                    placeholder = { Text("Например: Photosynthesis") },
+                    singleLine = false,
+                    maxLines = 3,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dialog_term_input")
+                )
+                OutlinedTextField(
+                    value = defText,
+                    onValueChange = { defText = it },
+                    label = { Text("Определение / перевод") },
+                    placeholder = { Text("Например: Процесс образования органики на свету") },
+                    singleLine = false,
+                    maxLines = 4,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dialog_definition_input")
+                )
+                OutlinedTextField(
+                    value = exampleText,
+                    onValueChange = { exampleText = it },
+                    label = { Text("Пример (необязательно)") },
+                    singleLine = false,
+                    maxLines = 2,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dialog_example_input")
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(termText, defText, exampleText.ifBlank { null }) },
+                enabled = termText.isNotBlank() && defText.isNotBlank(),
+                modifier = Modifier.testTag("dialog_save_term_button")
+            ) {
+                Text("Сохранить", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (onDelete != null) {
+                    TextButton(
+                        onClick = onDelete,
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.testTag("dialog_delete_term_button")
+                    ) {
+                        Text("Удалить")
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Отмена")
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun ModuleInfoEditorDialog(
+    initialTitle: String,
+    initialDescription: String,
+    initialCategory: String,
+    onDismiss: () -> Unit,
+    onSave: (title: String, description: String, category: String) -> Unit
+) {
+    var titleText by remember(initialTitle) { mutableStateOf(initialTitle) }
+    var descText by remember(initialDescription) { mutableStateOf(initialDescription) }
+    var catText by remember(initialCategory) { mutableStateOf(initialCategory) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(text = "Редактировать модуль", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = titleText,
+                    onValueChange = { titleText = it },
+                    label = { Text("Название") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = catText,
+                    onValueChange = { catText = it },
+                    label = { Text("Категория / Папка") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = descText,
+                    onValueChange = { descText = it },
+                    label = { Text("Описание") },
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(titleText, descText, catText) },
+                enabled = titleText.isNotBlank()
+            ) {
+                Text("Сохранить")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        }
+    )
 }
 
 @Composable
@@ -631,7 +1059,6 @@ private fun MasteryProgressRowCard(
                 ) {
                     Canvas(modifier = Modifier.size(42.dp)) {
                         val strokeWidth = 4.dp.toPx()
-                        // Track arc (open at bottom like gauge in screenshot)
                         drawArc(
                             color = trackColor,
                             startAngle = 135f,
@@ -679,7 +1106,9 @@ private fun MasteryProgressRowCard(
 private fun TermItemMd3Card(
     card: Flashcard,
     onSpeak: () -> Unit,
-    onToggleStar: () -> Unit
+    onLongPressSpeak: () -> Unit,
+    onToggleStar: () -> Unit,
+    onEdit: () -> Unit
 ) {
     val s = LocalStrings.current
     val (statusLabel, statusColor) = when (card.status) {
@@ -734,16 +1163,26 @@ private fun TermItemMd3Card(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
-                        onClick = onSpeak,
-                        modifier = Modifier.size(36.dp)
+                        onClick = onEdit,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("edit_term_button_${card.id}")
                     ) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                            contentDescription = "Speak",
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Редактировать термин",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
+                    com.example.quizapp.ui.components.TtsSpeakButton(
+                        onClick = onSpeak,
+                        onLongClick = onLongPressSpeak,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        contentDescriptionText = "Speak",
+                        iconSize = 20.dp,
+                        modifier = Modifier.testTag("term_tts_button_${card.id}")
+                    )
                     IconButton(
                         onClick = onToggleStar,
                         modifier = Modifier

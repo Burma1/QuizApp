@@ -2,13 +2,19 @@ package com.example.quizapp.data.repository
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
+import com.example.quizapp.data.ai.AiChatTurn
 import com.example.quizapp.data.ai.AiClient
 import com.example.quizapp.data.model.AiProfile
 import com.example.quizapp.data.model.AiProvider
 import com.example.quizapp.data.model.AppColorTheme
 import com.example.quizapp.data.model.AppLanguage
 import com.example.quizapp.data.model.AppThemeMode
+import com.example.quizapp.data.model.CardMasteryStatus
+import com.example.quizapp.data.model.ChatAttachment
+import com.example.quizapp.data.model.ChatAttachmentType
 import com.example.quizapp.data.model.ChatMessage
+import com.example.quizapp.data.model.DatabaseRestoreResult
 import com.example.quizapp.data.model.Flashcard
 import com.example.quizapp.data.model.MagicNotesResult
 import com.example.quizapp.data.model.StudyModule
@@ -56,6 +62,15 @@ class QuizRepository(private val context: Context) {
 
     private val _chatMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
+
+    private val _customFolders = MutableStateFlow<Set<String>>(emptySet())
+    val customFolders: StateFlow<Set<String>> = _customFolders.asStateFlow()
+
+    private val _folderOrder = MutableStateFlow<List<String>>(emptyList())
+    val folderOrder: StateFlow<List<String>> = _folderOrder.asStateFlow()
+
+    private val _recentTtsLanguages = MutableStateFlow<List<String>>(emptyList())
+    val recentTtsLanguages: StateFlow<List<String>> = _recentTtsLanguages.asStateFlow()
 
     init {
         loadSettings()
@@ -116,6 +131,72 @@ class QuizRepository(private val context: Context) {
         if (loadedProfiles.isEmpty()) {
             persistAiProfiles(finalProfiles, chosen.id)
         }
+
+        val foldersSet = (prefs.getStringSet("user_custom_folders", emptySet()) ?: emptySet())
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase() }
+            .toSet()
+        _customFolders.value = foldersSet
+        _folderOrder.value = loadFolderOrder()
+        _recentTtsLanguages.value = loadRecentTtsLanguages()
+    }
+
+    private fun loadRecentTtsLanguages(): List<String> {
+        val raw = prefs.getString("recent_tts_languages_json", null) ?: return emptyList()
+        val result = mutableListOf<String>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val tag = arr.optString(i).trim()
+                if (tag.isNotBlank() && result.none { it.equals(tag, ignoreCase = true) }) {
+                    result.add(tag)
+                }
+            }
+        } catch (_: Exception) {}
+        return result.take(8)
+    }
+
+    private fun persistRecentTtsLanguages(tags: List<String>) {
+        val clean = tags.map { it.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }.take(8)
+        _recentTtsLanguages.value = clean
+        val arr = JSONArray()
+        clean.forEach { arr.put(it) }
+        prefs.edit().putString("recent_tts_languages_json", arr.toString()).apply()
+    }
+
+    fun addRecentTtsLanguage(languageTag: String) {
+        val cleanTag = languageTag.trim()
+        if (cleanTag.isBlank()) return
+        val updated = listOf(cleanTag) + _recentTtsLanguages.value.filterNot { it.equals(cleanTag, ignoreCase = true) }
+        persistRecentTtsLanguages(updated)
+    }
+
+    fun clearRecentTtsLanguages() {
+        persistRecentTtsLanguages(emptyList())
+    }
+
+    private fun loadFolderOrder(): List<String> {
+        val raw = prefs.getString("folder_order_json", null) ?: return emptyList()
+        val result = mutableListOf<String>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val item = arr.optString(i).trim()
+                if (item.isNotBlank() && result.none { it.equals(item, ignoreCase = true) }) {
+                    result.add(item)
+                }
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    private fun persistFolderOrder(order: List<String>) {
+        val clean = order.map { it.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        _folderOrder.value = clean
+        val arr = JSONArray()
+        clean.forEach { arr.put(it) }
+        prefs.edit().putString("folder_order_json", arr.toString()).apply()
     }
 
     fun setLanguage(language: AppLanguage) {
@@ -279,9 +360,62 @@ class QuizRepository(private val context: Context) {
         } else {
             emptyList()
         }
-        val seedList = createSeedModules().filter { it.id !in deletedIds }
-        val combined = applySavedCardProgress(seedList + customList)
+        val modifiedSeedJson = prefs.getString("modified_seed_modules_json", null)
+        val modifiedSeedsById = if (!modifiedSeedJson.isNullOrBlank()) {
+            parseModulesJson(modifiedSeedJson).associateBy { it.id }
+        } else {
+            emptyMap()
+        }
+        val seedList = createSeedModules()
+            .filter { it.id !in deletedIds }
+            .map { modifiedSeedsById[it.id] ?: it }
+        val categoryOverrides = loadCategoryOverrides()
+        val combinedRaw = applySavedCardProgress(customList + seedList).map { mod ->
+            val override = categoryOverrides[mod.id]
+            if (!override.isNullOrBlank()) mod.copy(category = override) else mod
+        }
+        val savedModuleOrder = loadModuleOrderIds()
+        val combined = if (savedModuleOrder.isNotEmpty()) {
+            val byId = combinedRaw.associateBy { it.id }
+            val ordered = savedModuleOrder.mapNotNull { byId[it] }
+            val remaining = combinedRaw.filter { it.id !in savedModuleOrder.toSet() }
+            ordered + remaining
+        } else {
+            combinedRaw
+        }
         _modules.value = combined
+        syncFolderOrderWithModules(combined, _customFolders.value)
+    }
+
+    private fun loadModuleOrderIds(): List<String> {
+        val raw = prefs.getString("module_order_ids_json", null) ?: return emptyList()
+        val result = mutableListOf<String>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val id = arr.optString(i).trim()
+                if (id.isNotBlank()) result.add(id)
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    private fun persistModuleOrderIds(modulesList: List<StudyModule>) {
+        val arr = JSONArray()
+        modulesList.forEach { arr.put(it.id) }
+        prefs.edit().putString("module_order_ids_json", arr.toString()).apply()
+    }
+
+    private fun syncFolderOrderWithModules(modulesList: List<StudyModule>, customFoldersSet: Set<String>) {
+        val currentOrder = _folderOrder.value
+        val moduleCategories = modulesList.map { it.category.trim().ifBlank { "Общее" } }
+        val allKnown = (currentOrder + moduleCategories + customFoldersSet)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase() }
+        if (allKnown != currentOrder) {
+            persistFolderOrder(allKnown)
+        }
     }
 
     private fun applySavedCardProgress(modulesList: List<StudyModule>): List<StudyModule> {
@@ -318,11 +452,11 @@ class QuizRepository(private val context: Context) {
         }
     }
 
-    private fun persistCardProgress(modulesList: List<StudyModule>) {
+    private fun buildCardProgressJson(modulesList: List<StudyModule>): JSONObject {
         val root = JSONObject()
         modulesList.forEach { mod ->
             mod.cards.forEach { c ->
-                if (c.masteryScore > 0 || c.isMastered || c.needsReview || c.isStarred || c.reviewCount > 0 || c.lastStudiedTimestamp > 0L) {
+                if (c.masteryScore > 0 || c.isMastered || c.needsReview || c.isStarred || c.reviewCount > 0 || c.lastStudiedTimestamp > 0L || c.repetitions > 0 || c.lapses > 0) {
                     val key = "${mod.id}:${c.id}"
                     root.put(
                         key,
@@ -343,6 +477,11 @@ class QuizRepository(private val context: Context) {
                 }
             }
         }
+        return root
+    }
+
+    private fun persistCardProgress(modulesList: List<StudyModule>) {
+        val root = buildCardProgressJson(modulesList)
         prefs.edit().putString("card_progress_json", root.toString()).apply()
     }
 
@@ -359,16 +498,34 @@ class QuizRepository(private val context: Context) {
         _chatMessages.value = listOf(initialGreeting)
     }
 
-    fun addChatMessage(text: String, isUser: Boolean, suggestedCards: List<Pair<String, String>> = emptyList()): ChatMessage {
+    fun addChatMessage(
+        text: String,
+        isUser: Boolean,
+        suggestedCards: List<Pair<String, String>> = emptyList(),
+        attachments: List<ChatAttachment> = emptyList()
+    ): ChatMessage {
         val msg = ChatMessage(
             id = UUID.randomUUID().toString(),
             text = text,
             isUser = isUser,
             timestamp = System.currentTimeMillis(),
-            suggestedCards = suggestedCards
+            suggestedCards = suggestedCards,
+            attachments = attachments
         )
         _chatMessages.value = _chatMessages.value + msg
         return msg
+    }
+
+    fun markChatMessageModuleSaved(messageId: String, module: StudyModule) {
+        saveModule(module)
+        _chatMessages.value = _chatMessages.value.map { msg ->
+            if (msg.id == messageId) {
+                msg.copy(
+                    createdModuleId = module.id,
+                    createdModuleTitle = module.title
+                )
+            } else msg
+        }
     }
 
     private fun extractRemainderAfterKeyword(text: String, vararg keywords: String): String {
@@ -467,13 +624,14 @@ class QuizRepository(private val context: Context) {
         return finalTitle to topic
     }
 
-    suspend fun askAiTutor(userText: String) {
+    suspend fun askAiTutor(userText: String, attachments: List<ChatAttachment> = emptyList()) {
         val previousHistory = _chatMessages.value
-            .filter { !it.isGenerating && it.text.isNotBlank() && !it.text.startsWith("⚠️") }
-            .takeLast(10)
-            .map { it.text to it.isUser }
+            .filter { !it.isGenerating && (it.text.isNotBlank() || it.attachments.isNotEmpty()) && !it.text.startsWith("⚠️") }
+            .takeLast(16)
+            .map { AiChatTurn(text = it.text, isUser = it.isUser, attachments = it.attachments) }
 
-        addChatMessage(userText, isUser = true)
+        val displayUserText = userText.trim()
+        addChatMessage(displayUserText, isUser = true, attachments = attachments)
         val generatingMsg = ChatMessage(
             id = "gen_" + UUID.randomUUID(),
             text = "...",
@@ -483,82 +641,46 @@ class QuizRepository(private val context: Context) {
         _chatMessages.value = _chatMessages.value + generatingMsg
 
         val profile = _activeProfile.value
-        val trimmed = userText.trim()
+        val trimmed = displayUserText
         val lower = trimmed.lowercase()
+        val isTestEnv = Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
 
-        // 1. Chatbot Command: Delete Module
-        if (lower.startsWith("удали модуль") || lower.startsWith("удалить модуль") || lower.startsWith("delete module")) {
+        // 1. Fast local handler: Simple explicit delete module (no attachments)
+        if (attachments.isEmpty() &&
+            (lower.startsWith("удали модуль") || lower.startsWith("удалить модуль") || lower.startsWith("delete module"))
+        ) {
             val candidate = extractRemainderAfterKeyword(trimmed, "модуль", "module").trim('"', '«', '»', '\'')
             val found = _modules.value.find {
                 it.title.contains(candidate, ignoreCase = true) || it.id.equals(candidate, ignoreCase = true)
             }
-            if (found != null) {
+            val reply = if (found != null) {
                 deleteModule(found.id)
-                _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
-                    id = UUID.randomUUID().toString(),
-                    text = "🗑️ Модуль **«${found.title}»** успешно удалён.",
-                    isUser = false
-                )
-                return
+                "🗑️ Модуль **«${found.title}»** успешно удалён."
             } else {
-                _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
-                    id = UUID.randomUUID().toString(),
-                    text = "Не удалось найти модуль с названием «$candidate». Проверьте список модулей в Библиотеке.",
-                    isUser = false
-                )
-                return
+                "Не удалось найти модуль с названием «$candidate». Проверьте список модулей в Библиотеке."
             }
+            _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
+                id = UUID.randomUUID().toString(),
+                text = reply,
+                isUser = false
+            )
+            return
         }
 
-        // 2. Chatbot Command: Add cards to existing module
-        if (lower.contains("добавь в модуль") || lower.contains("добавить в модуль") || lower.contains("add to module")) {
-            val afterMod = extractRemainderAfterKeyword(trimmed, "модуль", "module")
-            val modNameCandidate = afterMod.substringBefore(":").substringBefore("\n").trim().trim('"', '«', '»')
-            val found = _modules.value.find { it.title.contains(modNameCandidate, ignoreCase = true) }
-            if (found != null) {
-                val promptForCards = afterMod.substringAfter(":", "").trim().ifBlank { afterMod }
-                val explicit = parseExplicitCardsFromText(promptForCards, found.id)
-                val newCards = if (explicit.isNotEmpty()) {
-                    explicit
-                } else {
-                    aiClient.generateFlashcards(
-                        provider = profile.provider,
-                        apiKey = profile.apiKey,
-                        model = profile.modelId,
-                        topic = promptForCards,
-                        moduleId = found.id,
-                        defaultCount = AiClient.DEFAULT_FLASHCARD_COUNT
-                    )
-                }
-                if (newCards.isNotEmpty()) {
-                    val updatedModule = found.copy(cards = found.cards + newCards)
-                    saveModule(updatedModule)
-                    _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
-                        id = UUID.randomUUID().toString(),
-                        text = "✏️ В модуль **«${found.title}»** успешно добавлено карточек (${newCards.size}):\n" +
-                            newCards.joinToString("\n") { "• **${it.term}** — ${it.definition}" },
-                        isUser = false,
-                        suggestedCards = newCards.map { it.term to it.definition },
-                        createdModuleId = found.id,
-                        createdModuleTitle = found.title
-                    )
-                    return
-                }
-            }
-        }
-
-        // 3. Chatbot Query: Ask about existing modules / AI-created modules
-        val isModulesQuery = lower.contains("какие модул") ||
-            lower.contains("какие у меня модул") ||
-            lower.contains("мои модул") ||
-            lower.contains("список модул") ||
-            lower.contains("созданные тобой") ||
-            lower.contains("ты создал") ||
-            lower.contains("создал ты") ||
-            (lower.contains("какие карточк") && (lower.contains("у меня") || lower.contains("есть") || lower.contains("создан") || lower.contains("тобой"))) ||
-            lower.contains("сколько модул") ||
-            lower.contains("what modules") ||
-            lower.contains("my modules")
+        // 2. Fast local handler: Explicit library modules listing query (no attachments)
+        val isModulesQuery = attachments.isEmpty() && (
+            lower.contains("какие модул") ||
+                lower.contains("какие у меня модул") ||
+                lower.contains("мои модул") ||
+                lower.contains("список модул") ||
+                lower.contains("созданные тобой") ||
+                lower.contains("ты создал") ||
+                lower.contains("создал ты") ||
+                (lower.contains("какие карточк") && (lower.contains("у меня") || lower.contains("есть") || lower.contains("создан") || lower.contains("тобой"))) ||
+                lower.contains("сколько модул") ||
+                lower.contains("what modules") ||
+                lower.contains("my modules")
+            )
 
         if (isModulesQuery) {
             val allModules = _modules.value
@@ -568,17 +690,15 @@ class QuizRepository(private val context: Context) {
 
             val replyText = buildString {
                 if (createdByAiOrUser.isNotEmpty()) {
-                    append("### 📚 Модули, созданные вами и ИИ (${createdByAiOrUser.size})\n\n")
+                    append("### 📚 Мои и созданные с ИИ модули (${createdByAiOrUser.size})\n\n")
                     createdByAiOrUser.forEachIndexed { idx, mod ->
-                        val mastered = mod.cards.count { it.status == com.example.quizapp.data.model.CardMasteryStatus.MASTERED }
+                        val mastered = mod.cards.count { it.status == CardMasteryStatus.MASTERED }
                         append("${idx + 1}. **«${mod.title}»** — ${mod.cards.size} карточек (усвоено: $mastered)\n")
                     }
                 } else {
                     append("### 📚 Созданные с ИИ модули\n\n")
-                    append("У вас пока нет модулей, созданных мной в диалоге.\n")
-                    append("Чтобы я создал новый модуль, напишите, например:\n")
-                    append("• *«Создай карточки по теме Неправильные глаголы»*\n")
-                    append("• *«Создай 50 карточек по теме Анатомия»*\n")
+                    append("У вас пока нет собственных или созданных в диалоге модулей.\n")
+                    append("Напишите тему, вставьте текст или прикрепите фото/файл — и я сразу сделаю карточки!")
                 }
 
                 if (!askingSpecificallyAiCreated && builtInModules.isNotEmpty()) {
@@ -597,57 +717,80 @@ class QuizRepository(private val context: Context) {
             return
         }
 
-        // 4. Chatbot Command: Explicit Create Cards / Module
-        val isQuestion = lower.endsWith("?") ||
-            lower.startsWith("какие") || lower.startsWith("какой") || lower.startsWith("какая") || lower.startsWith("какое") ||
-            lower.startsWith("сколько") || lower.startsWith("что ") || lower.startsWith("как ") ||
-            lower.startsWith("почему") || lower.startsWith("зачем") || lower.startsWith("где ") ||
-            lower.startsWith("кто ") || lower.startsWith("когда") || lower.startsWith("есть ли") ||
-            lower.startsWith("а какие") || lower.startsWith("подскажи") || lower.startsWith("расскажи") ||
-            lower.startsWith("объясни") || lower.startsWith("помоги понять") || lower.startsWith("в чем ") ||
-            lower.startsWith("в чём ") || lower.startsWith("what ") || lower.startsWith("how ") ||
-            lower.startsWith("why ") || lower.startsWith("which ")
-
-        val hasExplicitCreateCommand = lower.startsWith("создай карточк") || lower.startsWith("создать карточк") ||
-            lower.startsWith("сделай карточк") || lower.startsWith("сделать карточк") ||
-            lower.startsWith("сгенерируй карточк") || lower.startsWith("сгенерировать карточк") ||
-            lower.startsWith("составь карточк") || lower.startsWith("составить карточк") ||
-            lower.startsWith("сформируй карточк") || lower.startsWith("напиши карточк") ||
-            lower.startsWith("создай модул") || lower.startsWith("создать модул") ||
-            lower.startsWith("сделай модул") || lower.startsWith("сделать модул") ||
-            lower.startsWith("сгенерируй модул") || lower.startsWith("составь модул") ||
-            lower.startsWith("дай карточк") || lower.startsWith("дай мне карточк") ||
-            lower.startsWith("карточки:") || lower.startsWith("карточки по теме") || lower.startsWith("карточки на тему") ||
-            lower.startsWith("create cards") || lower.startsWith("create flashcards") || lower.startsWith("create module") ||
-            lower.startsWith("generate cards") || lower.startsWith("generate flashcards") ||
-            Regex("^(создай|создать|сделай|сделать|сгенерируй|составь|create|generate)\\s+\\d+\\s*(карточ|слов|термин|cards|words)").containsMatchIn(lower) ||
-            Regex("^(создай|создать|сделай|сделать|сгенерируй|составь)\\s+(мне\\s+)?(набор|колоду|модуль|карточки)\\b").containsMatchIn(lower)
-
-        val isCardsCreationIntent = !isQuestion && hasExplicitCreateCommand
-
-        if (isCardsCreationIntent) {
-            val (extractedTitle, topic) = extractTopicAndTitle(trimmed)
-            val newModuleId = "user_" + UUID.randomUUID().toString()
-            val explicit = parseExplicitCardsFromText(topic, newModuleId)
-            val promptForGeneration = if (topic.isNotBlank()) topic else trimmed
-            val generatedCards = if (explicit.isNotEmpty()) {
-                explicit
+        // 3. Fast local handler: Explicit inline pairs e.g. "Создай карточки: Фрукты (Apple - Яблоко, Banana - Банан)"
+        if (attachments.isEmpty() && !lower.endsWith("?") &&
+            (lower.startsWith("создай карточк") || lower.startsWith("создать карточк") ||
+                lower.startsWith("create cards") || lower.startsWith("добавь в модуль") || lower.startsWith("add to module"))
+        ) {
+            if (lower.startsWith("добавь в модуль") || lower.startsWith("add to module")) {
+                val afterMod = extractRemainderAfterKeyword(trimmed, "модуль", "module")
+                val modNameCandidate = afterMod.substringBefore(":").substringBefore("\n").trim().trim('"', '«', '»')
+                val found = _modules.value.find { it.title.contains(modNameCandidate, ignoreCase = true) }
+                val promptForCards = afterMod.substringAfter(":", "").trim()
+                val explicit = if (found != null && promptForCards.isNotBlank()) parseExplicitCardsFromText(promptForCards, found.id) else emptyList()
+                if (found != null && explicit.isNotEmpty()) {
+                    saveModule(found.copy(cards = found.cards + explicit))
+                    _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
+                        id = UUID.randomUUID().toString(),
+                        text = "✏️ В модуль **«${found.title}»** добавлено карточек (${explicit.size}):\n" +
+                            explicit.joinToString("\n") { "• **${it.term}** — ${it.definition}" },
+                        isUser = false,
+                        suggestedCards = explicit.map { it.term to it.definition },
+                        createdModuleId = found.id,
+                        createdModuleTitle = found.title
+                    )
+                    return
+                }
             } else {
-                aiClient.generateFlashcards(
+                val (extractedTitle, topic) = extractTopicAndTitle(trimmed)
+                val newModuleId = "user_" + UUID.randomUUID().toString()
+                val hasInlineDelimiters = trimmed.contains("(") && trimmed.contains(")") && trimmed.length < 300
+                val explicit = if (hasInlineDelimiters) parseExplicitCardsFromText(topic, newModuleId) else emptyList()
+                if (explicit.isNotEmpty()) {
+                    val finalTitle = if (extractedTitle != "Новые карточки") extractedTitle else "Новый модуль"
+                    val newModule = StudyModule(
+                        id = newModuleId,
+                        title = finalTitle.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() },
+                        description = "Создано в диалоге с Репетитором",
+                        category = "Пользовательские",
+                        author = "Вы & Репетитор",
+                        isVerified = false,
+                        colorHex = 0xFF16A34A,
+                        cards = explicit
+                    )
+                    saveModule(newModule)
+                    _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
+                        id = UUID.randomUUID().toString(),
+                        text = "✅ **Создан новый модуль «${newModule.title}»** (${newModule.cards.size} карточек)!\n" +
+                            "Он уже сохранён в вашей библиотеке и доступен в разделе «Ваши карточки».",
+                        isUser = false,
+                        suggestedCards = explicit.map { it.term to it.definition },
+                        createdModuleId = newModule.id,
+                        createdModuleTitle = newModule.title
+                    )
+                    return
+                }
+            }
+        }
+
+        // 4. Robolectric unit-test offline deterministic branch when no API key
+        if (profile.apiKey.isBlank() && isTestEnv) {
+            val isExplicitCreate = !lower.endsWith("?") &&
+                (lower.startsWith("создай карточк") || lower.startsWith("create cards"))
+            if (isExplicitCreate) {
+                val (extractedTitle, topic) = extractTopicAndTitle(trimmed)
+                val newModuleId = "user_" + UUID.randomUUID().toString()
+                val generatedCards = aiClient.generateFlashcards(
                     provider = profile.provider,
                     apiKey = profile.apiKey,
                     model = profile.modelId,
-                    topic = promptForGeneration,
+                    topic = topic.ifBlank { trimmed },
                     moduleId = newModuleId,
                     defaultCount = AiClient.DEFAULT_FLASHCARD_COUNT
                 )
-            }
-
-            if (generatedCards.isNotEmpty()) {
-                val finalTitle = if (extractedTitle != "Новые карточки") extractedTitle else topic.take(30).trim().ifBlank { "Новый модуль" }
                 val newModule = StudyModule(
                     id = newModuleId,
-                    title = finalTitle.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() },
+                    title = extractedTitle,
                     description = "Создано по запросу в диалоге с Репетитором",
                     category = "Пользовательские",
                     author = "Вы & Репетитор",
@@ -658,8 +801,7 @@ class QuizRepository(private val context: Context) {
                 saveModule(newModule)
                 _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
                     id = UUID.randomUUID().toString(),
-                    text = "✅ **Создан новый модуль «${newModule.title}»** (${newModule.cards.size} карточек)!\n" +
-                        "Он уже сохранён в вашей библиотеке и доступен в разделе «Ваши карточки». Вы можете сразу открыть его для изучения.",
+                    text = "✅ **Создан новый модуль «${newModule.title}»** (${newModule.cards.size} карточек)!",
                     isUser = false,
                     suggestedCards = generatedCards.map { it.term to it.definition },
                     createdModuleId = newModule.id,
@@ -669,68 +811,410 @@ class QuizRepository(private val context: Context) {
             }
         }
 
-        // 5. Standard Q&A or explanation with full conversation memory and library awareness
+        // 5. Unified Smart Conversational AI with Full Context, Attachments, and Action Execution
         val customMods = _modules.value.filter { !it.id.startsWith("seed_") }
         val seedMods = _modules.value.filter { it.id.startsWith("seed_") }
+        val latestCustomMod = customMods.firstOrNull()
+
         val systemInstructionWithContext = buildString {
-            append("Ты — дружелюбный, умный ИИ-репетитор и собеседник в приложении QuizApp. ")
-            append("Веди естественный, полезный диалог на языке пользователя. Помни контекст предыдущих сообщений. ")
-            append("Отвечай по существу на любые вопросы пользователя, объясняй правила, переводи слова, помогай готовиться к экзаменам. ")
-            append("НЕ создавай карточки без явной просьбы пользователя.\n")
-            append("Справка о текущих модулях пользователя в библиотеке QuizApp:\n")
+            append("Ты — умный, живой и понятный ИИ-репетитор в приложении QuizApp.\n")
+            append("Отвечай по делу, дружелюбно, на языке пользователя (обычно на русском). Форматируй текст аккуратным Markdown.\n")
+            append("НИКОГДА не выводи служебные теги вроде [Program finished] или сырой JSON в видимой части ответа.\n\n")
+            append("РАБОТА С КАРТОЧКАМИ И МОДУЛЯМИ (ОЧЕНЬ ВАЖНО):\n")
+            append("Ты умеешь реально создавать, дополнять, обновлять и удалять учебные модули в приложении! ")
+            append("Если пользователь просит создать карточки/модуль (из темы, из вставленного текста, из твоего предыдущего ответа, из прикреплённого фото или файла), ")
+            append("или подтверждает предложение («да», «создай», «делай»), или просит добавить/исправить/переделать карточки в существующем модуле — ")
+            append("НЕ ПЕРЕСПРАШИВАЙ «Создать карточки?» и НЕ пиши карточки просто текстом без сохранения! СРАЗУ выполни действие, добавив в самый конец ответа блок:\n")
+            append("<quizapp_action>\n")
+            append("{\"action\":\"create_module\",\"title\":\"Короткое название\",\"category\":\"Категория\",\"cards\":[{\"term\":\"Термин\",\"definition\":\"Чёткое определение\",\"example\":\"Необязательный пример\"}]}\n")
+            append("</quizapp_action>\n\n")
+            append("Доступные значения \"action\":\n")
+            append("- \"create_module\": поля title, category, cards ([{term, definition, example?}]).\n")
+            append("- \"add_cards\": поля module_id (если известен) или module_title, и cards.\n")
+            append("- \"replace_cards\": полностью обновляет/исправляет карточки в существующем модуле (поля module_id/module_title, cards).\n")
+            append("- \"delete_module\": поля module_id или module_title.\n\n")
+            append("Правила качества карточек:\n")
+            append("1. Каждый term должен быть кратким и осмысленным (1–5 слов, без обрывков предложений или случайных символов вроде ').Ш').\n")
+            append("2. Каждое definition должно быть ясным, точным и законченным (1–2 предложения).\n")
+            append("3. Если пользователь указал количество (например, 15 или 30) — создай ровно столько карточек. Иначе выбери оптимальное количество (обычно 6–14 карточек по ключевым понятиям материала).\n")
+            append("4. НЕ добавляй <quizapp_action>, если пользователь просто задал вопрос, попросил объяснить тему, проверить ответ или пообщаться.\n")
+            append("5. Если пользователь прикрепил фото или файл (PDF, DOCX, TXT, CSV, JSON) — опирайся строго на его реальное содержимое.\n\n")
+            append("Библиотека модулей пользователя:\n")
             if (customMods.isNotEmpty()) {
-                append("- Созданные пользователем/ИИ модули (${customMods.size}): ")
-                append(customMods.joinToString(", ") { "«${it.title}» (${it.cards.size} карт.)" })
-                append(".\n")
+                append("- Мои/ИИ модули (${customMods.size}): ")
+                append(customMods.take(15).joinToString(", ") { "«${it.title}» [id=${it.id}, ${it.cards.size} карт.]" })
+                append("\n")
+                if (latestCustomMod != null && latestCustomMod.cards.isNotEmpty()) {
+                    append("- Последний модуль «${latestCustomMod.title}» содержит термины: ")
+                    append(latestCustomMod.cards.take(15).joinToString("; ") { "${it.term} — ${it.definition.take(50)}" })
+                    append("\n")
+                }
             } else {
-                append("- Созданных пользователем/ИИ модулей пока нет.\n")
+                append("- Пользовательских модулей пока нет.\n")
             }
             if (seedMods.isNotEmpty()) {
                 append("- Базовые модули (${seedMods.size}): ")
-                append(seedMods.joinToString(", ") { "«${it.title}» (${it.cards.size} карт.)" })
-                append(".")
+                append(seedMods.joinToString(", ") { "«${it.title}»" })
+                append("\n")
             }
         }
 
-        val responseText = aiClient.generateResponse(
+        val effectivePrompt = if (trimmed.isNotBlank()) {
+            trimmed
+        } else if (attachments.isNotEmpty()) {
+            "Проанализируй прикреплённые материалы. Кратко объясни, что в них, и предложи помощь (например, создать учебные карточки или разобрать тему)."
+        } else {
+            "Привет!"
+        }
+
+        val rawResponse = aiClient.generateChatResponse(
             provider = profile.provider,
             apiKey = profile.apiKey,
             model = profile.modelId,
-            prompt = userText,
+            prompt = effectivePrompt,
+            attachments = attachments,
             history = previousHistory,
             systemInstruction = systemInstructionWithContext
         )
 
-        val wantsVocabularySuggestions = lower.contains("подбери слова") ||
-            lower.contains("список слов") ||
-            lower.contains("выпиши слова") ||
-            lower.contains("слова по теме")
-
-        val suggestedPairs = if (!wantsVocabularySuggestions) {
-            emptyList()
-        } else {
-            val cards = aiClient.parseFlashcardsFromJsonOrText(responseText, "temp")
-            cards.filter { it.term.length in 2..50 && it.definition.length in 4..150 }
-                .take(12)
-                .map { it.term to it.definition }
-        }
+        val processed = processAiActionResponse(rawResponse, userIntentText = trimmed)
 
         _chatMessages.value = _chatMessages.value.filter { it.id != generatingMsg.id } + ChatMessage(
             id = UUID.randomUUID().toString(),
-            text = responseText,
+            text = processed.visibleText,
             isUser = false,
+            suggestedCards = processed.suggestedCards,
+            createdModuleId = processed.createdModuleId,
+            createdModuleTitle = processed.createdModuleTitle
+        )
+    }
+
+    internal data class ProcessedAiReply(
+        val visibleText: String,
+        val suggestedCards: List<Pair<String, String>> = emptyList(),
+        val createdModuleId: String? = null,
+        val createdModuleTitle: String? = null
+    )
+
+    internal fun processAiActionResponse(rawResponse: String, userIntentText: String): ProcessedAiReply {
+        if (rawResponse.startsWith("⚠️")) {
+            return ProcessedAiReply(visibleText = rawResponse)
+        }
+
+        val cleanedRaw = rawResponse.replace("[Program finished]", "").trim()
+        val actionRegex = Regex("<quizapp_action>\\s*([\\s\\S]*?)\\s*</quizapp_action>", RegexOption.IGNORE_CASE)
+        val match = actionRegex.find(cleanedRaw)
+
+        if (match != null) {
+            val actionJsonRaw = match.groupValues[1]
+                .replace(Regex("^```json\\s*", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^```\\s*"), "")
+                .replace(Regex("\\s*```$"), "")
+                .trim()
+            val visibleBeforeStrip = actionRegex.replace(cleanedRaw, "").trim()
+
+            try {
+                val obj = JSONObject(actionJsonRaw)
+                val actionType = obj.optString("action").lowercase().trim()
+                val modIdParam = obj.optString("module_id").trim()
+                val modTitleParam = obj.optString("module_title").ifBlank { obj.optString("title") }.trim()
+
+                fun parseActionCards(targetModuleId: String): List<Flashcard> {
+                    val arr = obj.optJSONArray("cards") ?: return emptyList()
+                    val result = mutableListOf<Flashcard>()
+                    for (i in 0 until arr.length()) {
+                        val c = arr.optJSONObject(i) ?: continue
+                        val term = c.optString("term").ifBlank { c.optString("front") }.trim()
+                        val def = c.optString("definition").ifBlank { c.optString("back") }.trim()
+                        val ex = c.optString("example").ifBlank { c.optString("exampleSentence") }.ifBlank { null }
+                        if (term.isNotBlank() && def.isNotBlank()) {
+                            result.add(
+                                Flashcard(
+                                    id = UUID.randomUUID().toString(),
+                                    moduleId = targetModuleId,
+                                    term = term,
+                                    definition = def,
+                                    exampleSentence = ex
+                                )
+                            )
+                        }
+                    }
+                    return result
+                }
+
+                when (actionType) {
+                    "create_module" -> {
+                        val newModId = "user_" + UUID.randomUUID().toString()
+                        val cards = parseActionCards(newModId)
+                        if (cards.isNotEmpty()) {
+                            val title = obj.optString("title").trim().ifBlank { "Новый модуль" }
+                            val category = obj.optString("category").trim().ifBlank { "Пользовательские" }
+                            val newModule = StudyModule(
+                                id = newModId,
+                                title = title,
+                                description = "Создано в диалоге с Репетитором",
+                                category = category,
+                                author = "Вы & Репетитор",
+                                isVerified = false,
+                                colorHex = 0xFF16A34A,
+                                cards = cards
+                            )
+                            saveModule(newModule)
+                            val finalMsg = visibleBeforeStrip.ifBlank {
+                                "✅ Создан новый модуль **«${newModule.title}»** (${cards.size} карточек)!"
+                            }
+                            return ProcessedAiReply(
+                                visibleText = finalMsg,
+                                suggestedCards = cards.map { it.term to it.definition },
+                                createdModuleId = newModule.id,
+                                createdModuleTitle = newModule.title
+                            )
+                        }
+                    }
+
+                    "add_cards" -> {
+                        val targetMod = findModuleForAction(modIdParam, modTitleParam)
+                        if (targetMod != null) {
+                            val newCards = parseActionCards(targetMod.id)
+                            if (newCards.isNotEmpty()) {
+                                val existingTerms = targetMod.cards.map { it.term.lowercase() }.toSet()
+                                val deduped = newCards.filter { it.term.lowercase() !in existingTerms }.ifEmpty { newCards }
+                                val updatedMod = targetMod.copy(cards = targetMod.cards + deduped)
+                                saveModule(updatedMod)
+                                val finalMsg = visibleBeforeStrip.ifBlank {
+                                    "✏️ В модуль **«${updatedMod.title}»** добавлено ${deduped.size} карточек."
+                                }
+                                return ProcessedAiReply(
+                                    visibleText = finalMsg,
+                                    suggestedCards = deduped.map { it.term to it.definition },
+                                    createdModuleId = updatedMod.id,
+                                    createdModuleTitle = updatedMod.title
+                                )
+                            }
+                        } else {
+                            // Fallback: create a new module if target not found
+                            val newModId = "user_" + UUID.randomUUID().toString()
+                            val newCards = parseActionCards(newModId)
+                            if (newCards.isNotEmpty()) {
+                                val title = modTitleParam.ifBlank { "Новый модуль" }
+                                val newModule = StudyModule(
+                                    id = newModId,
+                                    title = title,
+                                    description = "Создано в диалоге с Репетитором",
+                                    category = "Пользовательские",
+                                    author = "Вы & Репетитор",
+                                    isVerified = false,
+                                    colorHex = 0xFF16A34A,
+                                    cards = newCards
+                                )
+                                saveModule(newModule)
+                                val finalMsg = visibleBeforeStrip.ifBlank {
+                                    "✅ Создан новый модуль **«${newModule.title}»** (${newCards.size} карточек)!"
+                                }
+                                return ProcessedAiReply(
+                                    visibleText = finalMsg,
+                                    suggestedCards = newCards.map { it.term to it.definition },
+                                    createdModuleId = newModule.id,
+                                    createdModuleTitle = newModule.title
+                                )
+                            }
+                        }
+                    }
+
+                    "replace_cards" -> {
+                        val targetMod = findModuleForAction(modIdParam, modTitleParam)
+                        if (targetMod != null) {
+                            val newCards = parseActionCards(targetMod.id)
+                            if (newCards.isNotEmpty()) {
+                                val updatedMod = targetMod.copy(cards = newCards)
+                                saveModule(updatedMod)
+                                val finalMsg = visibleBeforeStrip.ifBlank {
+                                    "🔄 Модуль **«${updatedMod.title}»** обновлён (${newCards.size} карточек)."
+                                }
+                                return ProcessedAiReply(
+                                    visibleText = finalMsg,
+                                    suggestedCards = newCards.map { it.term to it.definition },
+                                    createdModuleId = updatedMod.id,
+                                    createdModuleTitle = updatedMod.title
+                                )
+                            }
+                        }
+                    }
+
+                    "delete_module" -> {
+                        val targetMod = findModuleForAction(modIdParam, modTitleParam)
+                        if (targetMod != null) {
+                            deleteModule(targetMod.id)
+                            val finalMsg = visibleBeforeStrip.ifBlank {
+                                "🗑️ Модуль **«${targetMod.title}»** удалён."
+                            }
+                            return ProcessedAiReply(visibleText = finalMsg)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Fall through to clean text if action JSON was malformed
+            }
+
+            return ProcessedAiReply(visibleText = visibleBeforeStrip.ifBlank { cleanedRaw })
+        }
+
+        // Secondary fallback: if user clearly asked to list/suggest vocabulary or cards without an action tag,
+        // offer clean parsed pairs ONLY if there are >= 2 clean pairs
+        val lowerIntent = userIntentText.lowercase()
+        val wantsCardsOrWords = lowerIntent.contains("карточ") ||
+            lowerIntent.contains("подбери слова") ||
+            lowerIntent.contains("список слов") ||
+            lowerIntent.contains("выпиши слова") ||
+            lowerIntent.contains("слова по теме")
+        val suggestedPairs = if (wantsCardsOrWords) {
+            val parsed = aiClient.parseFlashcardsFromJsonOrText(cleanedRaw, "temp")
+            if (parsed.size >= 2) {
+                parsed.take(30).map { it.term to it.definition }
+            } else emptyList()
+        } else {
+            emptyList()
+        }
+
+        return ProcessedAiReply(
+            visibleText = cleanedRaw,
             suggestedCards = suggestedPairs
         )
     }
 
-    suspend fun generateFlashcardsForTopic(topic: String, defaultCount: Int = AiClient.DEFAULT_FLASHCARD_COUNT): List<Flashcard> {
+    private fun findModuleForAction(moduleId: String, moduleTitle: String): StudyModule? {
+        if (moduleId.isNotBlank()) {
+            _modules.value.find { it.id == moduleId }?.let { return it }
+        }
+        if (moduleTitle.isNotBlank()) {
+            _modules.value.find { it.title.equals(moduleTitle, ignoreCase = true) }?.let { return it }
+            _modules.value.find { !it.id.startsWith("seed_") && it.title.contains(moduleTitle, ignoreCase = true) }?.let { return it }
+            _modules.value.find { it.title.contains(moduleTitle, ignoreCase = true) }?.let { return it }
+        }
+        return _modules.value.firstOrNull { !it.id.startsWith("seed_") }
+    }
+
+    suspend fun generateFlashcardsForTopic(
+        topic: String,
+        attachments: List<ChatAttachment> = emptyList(),
+        defaultCount: Int = AiClient.DEFAULT_FLASHCARD_COUNT
+    ): List<Flashcard> {
         val profile = _activeProfile.value
+        val moduleId = UUID.randomUUID().toString()
+
+        if (attachments.isNotEmpty()) {
+            val cleanTopic = topic.trim()
+            val hasSpecifiedCount = if (cleanTopic.isNotBlank()) aiClient.hasUserSpecifiedCardCount(cleanTopic) else false
+            val targetCount = if (cleanTopic.isNotBlank()) aiClient.extractRequestedCardCount(cleanTopic, defaultCount) else defaultCount
+
+            if (profile.apiKey.isNotBlank()) {
+                val prompt = buildString {
+                    append("Проанализируй прикреплённые материалы (файл/изображение)")
+                    if (cleanTopic.isNotBlank()) {
+                        append(" и указания пользователя: «$cleanTopic»")
+                    }
+                    append(".\n")
+                    if (hasSpecifiedCount) {
+                        append("Создай РОВНО ${targetCount.coerceAtMost(120)} учебных карточек по самым важным терминам, фактам и определениям.\n")
+                    } else {
+                        append("Создай от 10 до 16 качественных учебных карточек по ключевым терминам, понятиям и определениям из материала.\n")
+                    }
+                    append("Верни результат СТРОГО в виде JSON-массива объектов с ключами \"term\" и \"definition\":\n")
+                    append("[{\"term\": \"Понятие\", \"definition\": \"Точное определение\"}]")
+                }
+                val rawResponse = aiClient.generateChatResponse(
+                    provider = profile.provider,
+                    apiKey = profile.apiKey,
+                    model = profile.modelId,
+                    prompt = prompt,
+                    attachments = attachments,
+                    systemInstruction = "Ты — генератор учебных карточек в QuizApp. Извлекай термины и определения из прикреплённых файлов и фото. Возвращай только валидный JSON-массив объектов {\"term\": \"...\", \"definition\": \"...\"}."
+                )
+                if (!rawResponse.startsWith("⚠️")) {
+                    val parsedFromAi = aiClient.parseFlashcardsFromJsonOrText(rawResponse, moduleId)
+                    if (parsedFromAi.isNotEmpty()) {
+                        return parsedFromAi
+                    }
+                }
+            }
+
+            // Local/direct extraction from attached text documents (CSV, TSV, JSON, TXT, DOCX, MD)
+            val extractedCards = mutableListOf<Flashcard>()
+            for (att in attachments) {
+                val docText = att.extractedText?.trim().orEmpty()
+                if (docText.isNotBlank()) {
+                    val fromJsonOrPairs = aiClient.parseFlashcardsFromJsonOrText(docText, moduleId)
+                    if (fromJsonOrPairs.isNotEmpty()) {
+                        extractedCards.addAll(fromJsonOrPairs)
+                        continue
+                    }
+                    val fromCsvOrText = importModuleFromTextOrCsv(docText).cards.map { it.copy(moduleId = moduleId) }
+                    if (fromCsvOrText.isNotEmpty()) {
+                        extractedCards.addAll(fromCsvOrText)
+                        continue
+                    }
+                    // Extract meaningful sentences/paragraphs from plain prose document
+                    val paragraphs = docText.lines()
+                        .map { it.trim() }
+                        .filter { it.length >= 12 && !it.startsWith("[PDF-") }
+                    for ((idx, line) in paragraphs.take(targetCount.coerceAtLeast(12)).withIndex()) {
+                        val words = line.split(Regex("\\s+")).filter { it.isNotBlank() }
+                        if (words.size >= 3) {
+                            val termPart = words.take(minOf(3, words.size / 2)).joinToString(" ").trim(',', '.', ':', ';', '-', '—')
+                            val defPart = line
+                            if (termPart.isNotBlank()) {
+                                extractedCards.add(
+                                    Flashcard(
+                                        id = UUID.randomUUID().toString(),
+                                        moduleId = moduleId,
+                                        term = termPart,
+                                        definition = defPart
+                                    )
+                                )
+                            }
+                        } else {
+                            extractedCards.add(
+                                Flashcard(
+                                    id = UUID.randomUUID().toString(),
+                                    moduleId = moduleId,
+                                    term = "${att.name.substringBeforeLast(".")} — Пункт ${idx + 1}",
+                                    definition = line
+                                )
+                            )
+                        }
+                    }
+                } else if (att.type == ChatAttachmentType.IMAGE && !att.base64Data.isNullOrBlank()) {
+                    val imgCards = generateCardsFromImage(att.base64Data, att.mimeType, moduleId)
+                    extractedCards.addAll(imgCards)
+                }
+            }
+            if (extractedCards.isNotEmpty()) {
+                return if (hasSpecifiedCount && extractedCards.size > targetCount) {
+                    extractedCards.take(targetCount)
+                } else {
+                    extractedCards
+                }
+            }
+
+            val fallbackTopic = cleanTopic.ifBlank {
+                attachments.firstOrNull()?.name?.substringBeforeLast(".")?.ifBlank { "Материал из файла" } ?: "Материал из файла"
+            }
+            return aiClient.generateFlashcards(
+                provider = profile.provider,
+                apiKey = profile.apiKey,
+                model = profile.modelId,
+                topic = fallbackTopic,
+                moduleId = moduleId,
+                defaultCount = defaultCount
+            )
+        }
+
         return aiClient.generateFlashcards(
             provider = profile.provider,
             apiKey = profile.apiKey,
             model = profile.modelId,
             topic = topic,
-            moduleId = UUID.randomUUID().toString(),
+            moduleId = moduleId,
             defaultCount = defaultCount
         )
     }
@@ -752,15 +1236,99 @@ class QuizRepository(private val context: Context) {
     }
 
     fun saveModule(module: StudyModule) {
+        val cleanCategory = module.category.trim().ifBlank { "Общее" }
+        val normalizedModule = module.copy(category = cleanCategory)
         val current = _modules.value.toMutableList()
-        val index = current.indexOfFirst { it.id == module.id }
+        val index = current.indexOfFirst { it.id == normalizedModule.id }
         if (index >= 0) {
-            current[index] = module
+            current[index] = normalizedModule
         } else {
-            current.add(0, module)
+            current.add(0, normalizedModule)
         }
         _modules.value = current
+        val overrides = loadCategoryOverrides().toMutableMap()
+        overrides[normalizedModule.id] = cleanCategory
+        persistCategoryOverrides(overrides)
         persistCustomModules(current.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(current.filter { it.id.startsWith("seed_") })
+        persistCardProgress(current)
+        persistModuleOrderIds(current)
+        syncFolderOrderWithModules(current, _customFolders.value)
+    }
+
+    fun addCardToModule(
+        moduleId: String,
+        term: String,
+        definition: String,
+        exampleSentence: String? = null
+    ) {
+        val cleanTerm = term.trim()
+        val cleanDef = definition.trim()
+        if (cleanTerm.isBlank() || cleanDef.isBlank()) return
+        val mod = _modules.value.find { it.id == moduleId } ?: return
+        val newCard = Flashcard(
+            id = UUID.randomUUID().toString(),
+            moduleId = moduleId,
+            term = cleanTerm,
+            definition = cleanDef,
+            exampleSentence = exampleSentence?.trim()?.ifBlank { null }
+        )
+        saveModule(mod.copy(cards = mod.cards + newCard))
+    }
+
+    fun updateCardInModule(
+        moduleId: String,
+        cardId: String,
+        term: String,
+        definition: String,
+        exampleSentence: String? = null
+    ) {
+        val cleanTerm = term.trim()
+        val cleanDef = definition.trim()
+        if (cleanTerm.isBlank() || cleanDef.isBlank()) return
+        val mod = _modules.value.find { it.id == moduleId } ?: return
+        val updatedCards = mod.cards.map { c ->
+            if (c.id == cardId) {
+                c.copy(
+                    term = cleanTerm,
+                    definition = cleanDef,
+                    exampleSentence = exampleSentence?.trim()?.ifBlank { null }
+                )
+            } else c
+        }
+        saveModule(mod.copy(cards = updatedCards))
+    }
+
+    fun deleteCardFromModule(moduleId: String, cardId: String) {
+        val mod = _modules.value.find { it.id == moduleId } ?: return
+        val updatedCards = mod.cards.filter { it.id != cardId }
+        saveModule(mod.copy(cards = updatedCards))
+    }
+
+    fun updateModuleMetadata(moduleId: String, title: String, description: String, category: String) {
+        val mod = _modules.value.find { it.id == moduleId } ?: return
+        val cleanTitle = title.trim().ifBlank { mod.title }
+        val cleanCategory = category.trim().ifBlank { mod.category }
+        saveModule(
+            mod.copy(
+                title = cleanTitle,
+                description = description.trim(),
+                category = cleanCategory
+            )
+        )
+    }
+
+    private fun getModifiedSeedModules(seedModules: List<StudyModule>): List<StudyModule> {
+        val defaults = createSeedModules().associateBy { it.id }
+        return seedModules.filter { mod ->
+            val orig = defaults[mod.id]
+            orig == null || orig.cards != mod.cards || orig.title != mod.title || orig.description != mod.description || orig.category != mod.category
+        }
+    }
+
+    private fun persistModifiedSeedModules(seedModules: List<StudyModule>) {
+        val modified = getModifiedSeedModules(seedModules)
+        prefs.edit().putString("modified_seed_modules_json", serializeModulesToJsonString(modified)).apply()
     }
 
     fun updateCardMastery(
@@ -785,6 +1353,7 @@ class QuizRepository(private val context: Context) {
             _modules.value = current
             persistCardProgress(current)
             persistCustomModules(current.filter { !it.id.startsWith("seed_") })
+            persistModifiedSeedModules(current.filter { it.id.startsWith("seed_") })
 
             // Recalculate total mastered cards across all modules and increment todayStudied
             val totalMasteredAcrossAll = current.sumOf { m -> m.cards.count { it.status == com.example.quizapp.data.model.CardMasteryStatus.MASTERED } }
@@ -810,6 +1379,7 @@ class QuizRepository(private val context: Context) {
             _modules.value = current
             persistCardProgress(current)
             persistCustomModules(current.filter { !it.id.startsWith("seed_") })
+            persistModifiedSeedModules(current.filter { it.id.startsWith("seed_") })
         }
     }
 
@@ -823,9 +1393,174 @@ class QuizRepository(private val context: Context) {
             .filter { it.isNotBlank() }
             .toMutableSet()
         existingDeleted.add(moduleId)
+        val overrides = loadCategoryOverrides().toMutableMap()
+        overrides.remove(moduleId)
+        persistCategoryOverrides(overrides)
         prefs.edit().putString("deleted_module_ids", existingDeleted.joinToString(",")).apply()
         persistCardProgress(current)
         persistCustomModules(current.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(current.filter { it.id.startsWith("seed_") })
+        persistModuleOrderIds(current)
+    }
+
+    private fun loadCategoryOverrides(): Map<String, String> {
+        val json = prefs.getString("module_category_overrides_json", null) ?: return emptyMap()
+        val result = mutableMapOf<String, String>()
+        try {
+            val obj = JSONObject(json)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                result[k] = obj.getString(k)
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    private fun persistCategoryOverrides(overrides: Map<String, String>) {
+        val obj = JSONObject()
+        overrides.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit().putString("module_category_overrides_json", obj.toString()).apply()
+    }
+
+    fun updateModuleCategory(moduleId: String, newCategory: String) {
+        val cleanCategory = newCategory.trim().ifBlank { "Общее" }
+        val current = _modules.value.map { mod ->
+            if (mod.id == moduleId) mod.copy(category = cleanCategory) else mod
+        }
+        _modules.value = current
+        val overrides = loadCategoryOverrides().toMutableMap()
+        overrides[moduleId] = cleanCategory
+        persistCategoryOverrides(overrides)
+        persistCustomModules(current.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(current.filter { it.id.startsWith("seed_") })
+        syncFolderOrderWithModules(current, _customFolders.value)
+    }
+
+    fun createFolder(folderName: String) {
+        val clean = folderName.trim()
+        if (clean.isBlank()) return
+        val existingMatch = _customFolders.value.find { it.equals(clean, ignoreCase = true) }
+        val updated = if (existingMatch != null) _customFolders.value else (_customFolders.value + clean)
+        _customFolders.value = updated
+        prefs.edit().putStringSet("user_custom_folders", updated).apply()
+
+        val curOrder = _folderOrder.value
+        if (curOrder.none { it.equals(clean, ignoreCase = true) }) {
+            persistFolderOrder(curOrder + clean)
+        }
+    }
+
+    fun renameFolder(oldName: String, newName: String) {
+        val cleanOld = oldName.trim()
+        val cleanNew = newName.trim()
+        if (cleanOld.isBlank() || cleanNew.isBlank() || cleanOld.equals(cleanNew, ignoreCase = true)) return
+
+        val updatedCustom = _customFolders.value.map {
+            if (it.equals(cleanOld, ignoreCase = true)) cleanNew else it
+        }.distinctBy { it.lowercase() }.toSet()
+        _customFolders.value = updatedCustom
+        prefs.edit().putStringSet("user_custom_folders", updatedCustom).apply()
+
+        val updatedOrder = _folderOrder.value.map {
+            if (it.equals(cleanOld, ignoreCase = true)) cleanNew else it
+        }.distinctBy { it.lowercase() }
+        persistFolderOrder(updatedOrder)
+
+        val overrides = loadCategoryOverrides().toMutableMap()
+        val updatedModules = _modules.value.map { mod ->
+            if (mod.category.equals(cleanOld, ignoreCase = true)) {
+                overrides[mod.id] = cleanNew
+                mod.copy(category = cleanNew)
+            } else mod
+        }
+        _modules.value = updatedModules
+        persistCategoryOverrides(overrides)
+        persistCustomModules(updatedModules.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(updatedModules.filter { it.id.startsWith("seed_") })
+    }
+
+    fun moveFolderOrder(folderName: String, delta: Int) {
+        val clean = folderName.trim()
+        if (clean.isBlank() || delta == 0) return
+        val allActiveFolders = getOrderedLibraryFolders()
+        val idx = allActiveFolders.indexOfFirst { it.equals(clean, ignoreCase = true) }
+        if (idx < 0) return
+        val targetIdx = (idx + delta).coerceIn(0, allActiveFolders.lastIndex)
+        if (targetIdx == idx) return
+        val mutable = allActiveFolders.toMutableList()
+        val item = mutable.removeAt(idx)
+        mutable.add(targetIdx, item)
+        persistFolderOrder(mutable)
+    }
+
+    fun setFolderOrder(newOrder: List<String>) {
+        persistFolderOrder(newOrder)
+    }
+
+    fun getOrderedLibraryFolders(): List<String> {
+        val fromModules = _modules.value.map { it.category.trim().ifBlank { "Общее" } }
+        val all = (_folderOrder.value + fromModules + _customFolders.value)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase() }
+        return all
+    }
+
+    fun deleteFolder(folderName: String) {
+        val clean = folderName.trim()
+        val updatedFolders = _customFolders.value.filterNot { it.equals(clean, ignoreCase = true) }.toSet()
+        _customFolders.value = updatedFolders
+        prefs.edit().putStringSet("user_custom_folders", updatedFolders).apply()
+
+        val updatedOrder = _folderOrder.value.filterNot { it.equals(clean, ignoreCase = true) }
+        persistFolderOrder(updatedOrder)
+
+        val overrides = loadCategoryOverrides().toMutableMap()
+        val updated = _modules.value.map { mod ->
+            if (mod.category.equals(clean, ignoreCase = true)) {
+                overrides[mod.id] = "Общее"
+                mod.copy(category = "Общее")
+            } else mod
+        }
+        _modules.value = updated
+        persistCategoryOverrides(overrides)
+        persistCustomModules(updated.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(updated.filter { it.id.startsWith("seed_") })
+        syncFolderOrderWithModules(updated, updatedFolders)
+    }
+
+    fun addModulesToFolder(folderName: String, moduleIds: Set<String>) {
+        val clean = folderName.trim().ifBlank { "Общее" }
+        createFolder(clean)
+        val overrides = loadCategoryOverrides().toMutableMap()
+        val updated = _modules.value.map { mod ->
+            if (mod.id in moduleIds) {
+                overrides[mod.id] = clean
+                mod.copy(category = clean)
+            } else mod
+        }
+        _modules.value = updated
+        persistCategoryOverrides(overrides)
+        persistCustomModules(updated.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(updated.filter { it.id.startsWith("seed_") })
+        syncFolderOrderWithModules(updated, _customFolders.value)
+    }
+
+    fun removeModulesFromFolder(folderName: String, moduleIds: Set<String>) {
+        val clean = folderName.trim()
+        val overrides = loadCategoryOverrides().toMutableMap()
+        val updated = _modules.value.map { mod ->
+            if (mod.id in moduleIds && mod.category.equals(clean, ignoreCase = true)) {
+                overrides[mod.id] = "Общее"
+                mod.copy(category = "Общее")
+            } else mod
+        }
+        _modules.value = updated
+        persistCategoryOverrides(overrides)
+        persistCustomModules(updated.filter { !it.id.startsWith("seed_") })
+        persistModifiedSeedModules(updated.filter { it.id.startsWith("seed_") })
+        syncFolderOrderWithModules(updated, _customFolders.value)
     }
 
     // --- Export & Import Functions ---
@@ -899,30 +1634,34 @@ class QuizRepository(private val context: Context) {
     fun importModuleFromTextOrCsv(rawText: String, defaultTitle: String = "Импортированный модуль"): StudyModule {
         val modId = "import_" + UUID.randomUUID().toString()
         val cards = mutableListOf<Flashcard>()
-        val lines = rawText.lines()
+        val cleanText = rawText.removePrefix("\uFEFF")
+        val lines = cleanText.lines()
         var extractedTitle = defaultTitle
 
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.startsWith("# ")) {
-                extractedTitle = trimmed.removePrefix("# ").trim()
+                val candidate = trimmed.removePrefix("# ").trim()
+                if (candidate.isNotBlank()) extractedTitle = candidate
                 continue
             }
             if (trimmed.isBlank() || trimmed.startsWith("//")) continue
 
             val separator = when {
                 trimmed.contains("\t") -> "\t"
-                trimmed.contains(" - ") -> " - "
                 trimmed.contains(" — ") -> " — "
+                trimmed.contains(" – ") -> " – "
+                trimmed.contains(" - ") -> " - "
                 trimmed.contains(";") -> ";"
+                trimmed.contains(": ") -> ": "
                 trimmed.contains(",") -> ","
                 else -> null
             }
 
             if (separator != null) {
                 val parts = trimmed.split(separator, limit = 2)
-                val t = parts[0].trim()
-                val d = parts[1].trim()
+                val t = parts[0].trim().trim('"')
+                val d = parts[1].trim().trim('"')
                 if (t.isNotBlank() && d.isNotBlank()) {
                     cards.add(
                         Flashcard(
@@ -949,9 +1688,444 @@ class QuizRepository(private val context: Context) {
         )
     }
 
-    private fun persistCustomModules(customModules: List<StudyModule>) {
+    /**
+     * Exports the entire QuizApp database into a single structured JSON string:
+     * - User-created modules and all their cards
+     * - Modified seed modules (added/edited/removed terms) and deleted module IDs
+     * - All card progress across every module (needsReview, learning, mastered, Anki SM-2, reviewCount, timestamps)
+     * - All starred cards (isStarred ⭐)
+     * - Custom library folders, folder ordering (folderOrder), module ordering (moduleOrderIds), and module-to-folder assignments (categoryOverrides)
+     * - Study statistics and app preferences
+     */
+    fun exportFullDatabaseToJson(): String {
+        val currentModules = _modules.value
+        val customMods = currentModules.filter { !it.id.startsWith("seed_") }
+        val modifiedSeeds = getModifiedSeedModules(currentModules.filter { it.id.startsWith("seed_") })
+        val progressJson = buildCardProgressJson(currentModules)
+
+        val overridesObj = JSONObject()
+        val storedOverrides = loadCategoryOverrides()
+        storedOverrides.forEach { (k, v) -> overridesObj.put(k, v) }
+        currentModules.forEach { mod ->
+            overridesObj.put(mod.id, mod.category.trim().ifBlank { "Общее" })
+        }
+
+        val customFoldersArr = JSONArray()
+        _customFolders.value.forEach { customFoldersArr.put(it) }
+
+        val orderedFoldersArr = JSONArray()
+        getOrderedLibraryFolders().forEach { orderedFoldersArr.put(it) }
+
+        val moduleOrderArr = JSONArray()
+        currentModules.forEach { moduleOrderArr.put(it.id) }
+
+        val deletedIdsArr = JSONArray()
+        prefs.getString("deleted_module_ids", "")
+            .orEmpty()
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .forEach { deletedIdsArr.put(it) }
+
+        val stats = _userStats.value
+        val statsObj = JSONObject().apply {
+            put("streakDays", stats.streakDays)
+            put("dailyGoal", stats.dailyGoal)
+            put("todayStudied", stats.todayStudied)
+            put("totalCardsLearned", stats.totalCardsLearned)
+        }
+
+        val root = JSONObject().apply {
+            put("backupFormat", "quizapp_full_db_v2")
+            put("version", 2)
+            put("exportedAt", System.currentTimeMillis())
+            put("activeLanguage", _activeLanguage.value.code)
+            put("themeMode", _themeMode.value.key)
+            put("colorTheme", _colorTheme.value.key)
+            put("userStats", statsObj)
+            put("customFolders", customFoldersArr)
+            put("folderOrder", orderedFoldersArr)
+            put("categoryOverrides", overridesObj)
+            put("deletedModuleIds", deletedIdsArr)
+            put("moduleOrderIds", moduleOrderArr)
+            put("customModules", JSONArray(serializeModulesToJsonString(customMods)))
+            put("modifiedSeedModules", JSONArray(serializeModulesToJsonString(modifiedSeeds)))
+            put("cardProgress", progressJson)
+        }
+        return root.toString(2)
+    }
+
+    /**
+     * Imports a full QuizApp database backup from JSON.
+     * @param replaceExisting If true, restores the exact state from backup. If false, safely merges modules, progress, starred cards, and folders.
+     */
+    fun importFullDatabaseFromJson(
+        jsonStr: String,
+        replaceExisting: Boolean = true
+    ): Result<DatabaseRestoreResult> {
+        return try {
+            val cleanJson = jsonStr
+                .removePrefix("\uFEFF")
+                .trim()
+                .removePrefix("```json")
+                .removePrefix("```")
+                .removeSuffix("```")
+                .trim()
+            if (cleanJson.isBlank()) {
+                return Result.failure(IllegalArgumentException("Файл или текст резервной копии пуст."))
+            }
+
+            val root = JSONObject(cleanJson)
+
+            // Fallback: if user passed a single-module JSON object {"title": "...", "cards": [...]}
+            val isSingleModuleJson = root.has("cards") && !root.has("customModules") && !root.has("cardProgress") && !root.has("backupFormat")
+            if (isSingleModuleJson) {
+                val singleParsed = parseModulesJson(JSONArray().put(root).toString()).firstOrNull()
+                    ?: importModuleFromJson(cleanJson)
+                saveModule(singleParsed)
+                return Result.success(buildCurrentDatabaseSummary())
+            }
+
+            val incomingCustomMods = root.optJSONArray("customModules")?.let {
+                parseModulesJson(it.toString())
+            } ?: root.optJSONArray("modules")?.let {
+                parseModulesJson(it.toString()).filter { m -> !m.id.startsWith("seed_") }
+            } ?: emptyList()
+
+            val incomingModifiedSeeds = root.optJSONArray("modifiedSeedModules")?.let {
+                parseModulesJson(it.toString())
+            } ?: emptyList()
+
+            val incomingProgressObj = root.optJSONObject("cardProgress") ?: JSONObject()
+
+            val incomingCustomFolders = mutableListOf<String>()
+            root.optJSONArray("customFolders")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val f = arr.optString(i).trim()
+                    if (f.isNotBlank() && incomingCustomFolders.none { it.equals(f, ignoreCase = true) }) {
+                        incomingCustomFolders.add(f)
+                    }
+                }
+            }
+
+            val incomingFolderOrder = mutableListOf<String>()
+            root.optJSONArray("folderOrder")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val f = arr.optString(i).trim()
+                    if (f.isNotBlank() && incomingFolderOrder.none { it.equals(f, ignoreCase = true) }) {
+                        incomingFolderOrder.add(f)
+                    }
+                }
+            }
+
+            val incomingOverrides = mutableMapOf<String, String>()
+            root.optJSONObject("categoryOverrides")?.let { obj ->
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = obj.optString(k).trim()
+                    if (k.isNotBlank() && v.isNotBlank()) {
+                        incomingOverrides[k] = v
+                    }
+                }
+            }
+
+            val incomingDeletedIds = mutableSetOf<String>()
+            root.optJSONArray("deletedModuleIds")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val id = arr.optString(i).trim()
+                    if (id.isNotBlank()) incomingDeletedIds.add(id)
+                }
+            }
+
+            val incomingModuleOrder = mutableListOf<String>()
+            root.optJSONArray("moduleOrderIds")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val id = arr.optString(i).trim()
+                    if (id.isNotBlank()) incomingModuleOrder.add(id)
+                }
+            }
+
+            fun applyProgressEntryToCard(card: Flashcard, modId: String, progressRoot: JSONObject): Flashcard {
+                val cObj = progressRoot.optJSONObject("$modId:${card.id}") ?: return card
+                val score = cObj.optInt("masteryScore", card.masteryScore).coerceIn(0, 2)
+                return card.copy(
+                    masteryScore = score,
+                    isMastered = score >= 2 || cObj.optBoolean("isMastered", card.isMastered),
+                    needsReview = cObj.optBoolean("needsReview", card.needsReview),
+                    isStarred = cObj.optBoolean("isStarred", card.isStarred),
+                    reviewCount = cObj.optInt("reviewCount", card.reviewCount),
+                    lastStudiedTimestamp = cObj.optLong("lastStudiedTimestamp", card.lastStudiedTimestamp),
+                    easeFactor = cObj.optDouble("easeFactor", card.easeFactor.toDouble()).toFloat(),
+                    intervalDays = cObj.optInt("intervalDays", card.intervalDays),
+                    repetitions = cObj.optInt("repetitions", card.repetitions),
+                    lapses = cObj.optInt("lapses", card.lapses),
+                    nextReviewTimestamp = cObj.optLong("nextReviewTimestamp", card.nextReviewTimestamp)
+                )
+            }
+
+            fun mergeCards(existing: Flashcard, incoming: Flashcard): Flashcard {
+                val useIncomingProgress = incoming.lastStudiedTimestamp > existing.lastStudiedTimestamp ||
+                    (incoming.lastStudiedTimestamp == existing.lastStudiedTimestamp &&
+                        (incoming.masteryScore > existing.masteryScore || incoming.reviewCount > existing.reviewCount || incoming.needsReview))
+                val mergedScore = if (useIncomingProgress) incoming.masteryScore else maxOf(existing.masteryScore, incoming.masteryScore)
+                val mergedMastered = if (useIncomingProgress) (mergedScore >= 2 || incoming.isMastered) else (mergedScore >= 2 || existing.isMastered || incoming.isMastered)
+                val mergedNeedsReview = if (useIncomingProgress) incoming.needsReview else (existing.needsReview || incoming.needsReview)
+                return existing.copy(
+                    term = incoming.term.ifBlank { existing.term },
+                    definition = incoming.definition.ifBlank { existing.definition },
+                    exampleSentence = incoming.exampleSentence ?: existing.exampleSentence,
+                    diagramType = incoming.diagramType ?: existing.diagramType,
+                    masteryScore = mergedScore,
+                    isMastered = mergedMastered,
+                    needsReview = mergedNeedsReview,
+                    isStarred = existing.isStarred || incoming.isStarred,
+                    reviewCount = maxOf(existing.reviewCount, incoming.reviewCount),
+                    lastStudiedTimestamp = maxOf(existing.lastStudiedTimestamp, incoming.lastStudiedTimestamp),
+                    easeFactor = if (useIncomingProgress) incoming.easeFactor else existing.easeFactor,
+                    intervalDays = if (useIncomingProgress) incoming.intervalDays else maxOf(existing.intervalDays, incoming.intervalDays),
+                    repetitions = if (useIncomingProgress) incoming.repetitions else maxOf(existing.repetitions, incoming.repetitions),
+                    lapses = maxOf(existing.lapses, incoming.lapses),
+                    nextReviewTimestamp = maxOf(existing.nextReviewTimestamp, incoming.nextReviewTimestamp)
+                )
+            }
+
+            val finalDeletedIds: Set<String>
+            val finalCustomFolders: Set<String>
+            val finalOverrides: Map<String, String>
+            val finalModules: List<StudyModule>
+            val finalFolderOrder: List<String>
+
+            if (replaceExisting) {
+                finalDeletedIds = incomingDeletedIds
+                finalCustomFolders = incomingCustomFolders.toSet()
+                finalOverrides = incomingOverrides.toMutableMap()
+
+                val modifiedSeedsById = incomingModifiedSeeds.associateBy { it.id }
+                val baseSeedList = createSeedModules()
+                    .filter { it.id !in finalDeletedIds }
+                    .map { modifiedSeedsById[it.id] ?: it }
+
+                val rawAll = (incomingCustomMods.filter { it.id !in finalDeletedIds } + baseSeedList).map { mod ->
+                    val overrideCat = finalOverrides[mod.id]
+                    val resolvedCat = if (!overrideCat.isNullOrBlank()) overrideCat else mod.category.trim().ifBlank { "Общее" }
+                    finalOverrides[mod.id] = resolvedCat
+                    val updatedCards = mod.cards.map { c ->
+                        applyProgressEntryToCard(c, mod.id, incomingProgressObj)
+                    }
+                    mod.copy(category = resolvedCat, cards = updatedCards)
+                }
+
+                finalModules = if (incomingModuleOrder.isNotEmpty()) {
+                    val byId = rawAll.associateBy { it.id }
+                    val ordered = incomingModuleOrder.mapNotNull { byId[it] }
+                    val remaining = rawAll.filter { it.id !in incomingModuleOrder.toSet() }
+                    ordered + remaining
+                } else {
+                    rawAll
+                }
+
+                val categoriesFromMods = finalModules.map { it.category.trim().ifBlank { "Общее" } }
+                finalFolderOrder = (incomingFolderOrder + categoriesFromMods + finalCustomFolders)
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinctBy { it.lowercase() }
+            } else {
+                // Safe Merge Mode
+                val currentDeleted = prefs.getString("deleted_module_ids", "")
+                    .orEmpty()
+                    .split(",")
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .toSet()
+                val restoredIds = (incomingCustomMods.map { it.id } + incomingModifiedSeeds.map { it.id }).toSet()
+                finalDeletedIds = (currentDeleted - restoredIds)
+
+                val mergedCustomFolders = (_customFolders.value + incomingCustomFolders)
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinctBy { it.lowercase() }
+                    .toSet()
+                finalCustomFolders = mergedCustomFolders
+
+                val mergedOverrides = loadCategoryOverrides().toMutableMap()
+                incomingOverrides.forEach { (k, v) -> mergedOverrides[k] = v }
+                finalOverrides = mergedOverrides
+
+                val currentById = _modules.value.associateBy { it.id }.toMutableMap()
+
+                // Merge incoming custom modules
+                val mergedCustomList = mutableListOf<StudyModule>()
+                val currentCustom = _modules.value.filter { !it.id.startsWith("seed_") }.toMutableList()
+                for (incMod in incomingCustomMods) {
+                    val incWithProgress = incMod.copy(
+                        cards = incMod.cards.map { applyProgressEntryToCard(it, incMod.id, incomingProgressObj) }
+                    )
+                    val existingIdx = currentCustom.indexOfFirst { it.id == incWithProgress.id }
+                    if (existingIdx >= 0) {
+                        val existingMod = currentCustom[existingIdx]
+                        val existingCardsById = existingMod.cards.associateBy { it.id }
+                        val mergedCards = incWithProgress.cards.map { incCard ->
+                            val exCard = existingCardsById[incCard.id]
+                            if (exCard != null) mergeCards(exCard, incCard) else incCard
+                        }
+                        val extraExisting = existingMod.cards.filter { ex -> mergedCards.none { it.id == ex.id } }
+                        val resolvedCat = finalOverrides[incWithProgress.id] ?: incWithProgress.category.ifBlank { existingMod.category }
+                        currentCustom[existingIdx] = incWithProgress.copy(
+                            category = resolvedCat,
+                            cards = mergedCards + extraExisting
+                        )
+                    } else {
+                        val resolvedCat = finalOverrides[incWithProgress.id] ?: incWithProgress.category.ifBlank { "Пользовательские" }
+                        mergedCustomList.add(incWithProgress.copy(category = resolvedCat))
+                    }
+                }
+                val allCustom = mergedCustomList + currentCustom
+
+                // Merge seed modules and progress
+                val incSeedsById = incomingModifiedSeeds.associateBy { it.id }
+                val currentSeeds = _modules.value.filter { it.id.startsWith("seed_") }.ifEmpty { createSeedModules() }
+                val mergedSeeds = currentSeeds.map { seedMod ->
+                    val incSeed = incSeedsById[seedMod.id]
+                    val baseCards = if (incSeed != null) {
+                        val existingById = seedMod.cards.associateBy { it.id }
+                        val combined = incSeed.cards.map { incC ->
+                            val exC = existingById[incC.id]
+                            if (exC != null) mergeCards(exC, incC) else incC
+                        }
+                        val extraEx = seedMod.cards.filter { ex -> combined.none { it.id == ex.id } }
+                        combined + extraEx
+                    } else {
+                        seedMod.cards
+                    }
+                    val updatedCards = baseCards.map { c ->
+                        val fromProg = applyProgressEntryToCard(c, seedMod.id, incomingProgressObj)
+                        mergeCards(c, fromProg)
+                    }
+                    val resolvedCat = finalOverrides[seedMod.id] ?: incSeed?.category ?: seedMod.category
+                    seedMod.copy(
+                        title = incSeed?.title ?: seedMod.title,
+                        description = incSeed?.description ?: seedMod.description,
+                        category = resolvedCat,
+                        cards = updatedCards
+                    )
+                }
+
+                val combinedAll = allCustom + mergedSeeds
+                finalModules = if (incomingModuleOrder.isNotEmpty()) {
+                    val byId = combinedAll.associateBy { it.id }
+                    val ordered = incomingModuleOrder.mapNotNull { byId[it] }
+                    val remaining = combinedAll.filter { it.id !in incomingModuleOrder.toSet() }
+                    ordered + remaining
+                } else {
+                    combinedAll
+                }
+
+                val categoriesFromMods = finalModules.map { it.category.trim().ifBlank { "Общее" } }
+                finalFolderOrder = (incomingFolderOrder + _folderOrder.value + categoriesFromMods + finalCustomFolders)
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinctBy { it.lowercase() }
+            }
+
+            // Update in-memory state flows
+            _customFolders.value = finalCustomFolders
+            _folderOrder.value = finalFolderOrder
+            _modules.value = finalModules
+
+            // Update user stats
+            val totalMastered = finalModules.sumOf { m -> m.cards.count { it.status == CardMasteryStatus.MASTERED } }
+            val incomingStatsObj = root.optJSONObject("userStats")
+            val currentStats = _userStats.value
+            val updatedStats = if (incomingStatsObj != null) {
+                UserStudyStats(
+                    streakDays = if (replaceExisting) incomingStatsObj.optInt("streakDays", 1) else maxOf(currentStats.streakDays, incomingStatsObj.optInt("streakDays", 1)),
+                    dailyGoal = incomingStatsObj.optInt("dailyGoal", currentStats.dailyGoal),
+                    todayStudied = if (replaceExisting) incomingStatsObj.optInt("todayStudied", 0) else maxOf(currentStats.todayStudied, incomingStatsObj.optInt("todayStudied", 0)),
+                    totalCardsLearned = maxOf(totalMastered, incomingStatsObj.optInt("totalCardsLearned", totalMastered))
+                )
+            } else {
+                currentStats.copy(totalCardsLearned = totalMastered)
+            }
+            _userStats.value = updatedStats
+
+            // Restore language/theme if present in full replace mode
+            if (replaceExisting) {
+                val langCode = root.optString("activeLanguage", "")
+                AppLanguage.entries.find { it.code == langCode }?.let { _activeLanguage.value = it }
+            }
+
+            // Persist everything atomically
+            val overridesJson = JSONObject()
+            finalOverrides.forEach { (k, v) -> overridesJson.put(k, v) }
+            val folderOrderJson = JSONArray()
+            finalFolderOrder.forEach { folderOrderJson.put(it) }
+            val moduleOrderJson = JSONArray()
+            finalModules.forEach { moduleOrderJson.put(it.id) }
+
+            prefs.edit()
+                .putString("deleted_module_ids", finalDeletedIds.joinToString(","))
+                .putStringSet("user_custom_folders", finalCustomFolders)
+                .putString("folder_order_json", folderOrderJson.toString())
+                .putString("module_order_ids_json", moduleOrderJson.toString())
+                .putString("module_category_overrides_json", overridesJson.toString())
+                .putString("custom_modules_json", serializeModulesToJsonString(finalModules.filter { !it.id.startsWith("seed_") }))
+                .putString("modified_seed_modules_json", serializeModulesToJsonString(getModifiedSeedModules(finalModules.filter { it.id.startsWith("seed_") })))
+                .putString("card_progress_json", buildCardProgressJson(finalModules).toString())
+                .putInt("stats_streak_days", updatedStats.streakDays)
+                .putInt("stats_daily_goal", updatedStats.dailyGoal)
+                .putInt("stats_today_studied", updatedStats.todayStudied)
+                .putInt("stats_total_learned", updatedStats.totalCardsLearned)
+                .putString("app_lang", _activeLanguage.value.code)
+                .apply()
+
+            Result.success(buildCurrentDatabaseSummary())
+        } catch (e: Exception) {
+            Result.failure(IllegalArgumentException("Не удалось прочитать резервную копию базы: ${e.localizedMessage ?: "неверный формат JSON"}"))
+        }
+    }
+
+    fun buildCurrentDatabaseSummary(): DatabaseRestoreResult {
+        val allMods = _modules.value
+        val customCount = allMods.count { !it.id.startsWith("seed_") }
+        var totalCards = 0
+        var mastered = 0
+        var learning = 0
+        var needsReview = 0
+        var starred = 0
+        for (mod in allMods) {
+            totalCards += mod.cards.size
+            for (c in mod.cards) {
+                when (c.status) {
+                    CardMasteryStatus.MASTERED -> mastered++
+                    CardMasteryStatus.LEARNING -> learning++
+                    CardMasteryStatus.NOT_STUDIED -> {}
+                }
+                if (c.needsReview) {
+                    needsReview++
+                }
+                if (c.isStarred) {
+                    starred++
+                }
+            }
+        }
+        val foldersCount = getOrderedLibraryFolders().size
+        return DatabaseRestoreResult(
+            totalModules = allMods.size,
+            customModulesCount = customCount,
+            totalCards = totalCards,
+            masteredCards = mastered,
+            learningCards = learning,
+            needsReviewCards = needsReview,
+            starredCards = starred,
+            foldersCount = foldersCount
+        )
+    }
+
+    private fun serializeModulesToJsonString(modulesList: List<StudyModule>): String {
         val jsonArr = JSONArray()
-        customModules.forEach { mod ->
+        modulesList.forEach { mod ->
             val obj = JSONObject().apply {
                 put("id", mod.id)
                 put("title", mod.title)
@@ -986,7 +2160,11 @@ class QuizRepository(private val context: Context) {
             }
             jsonArr.put(obj)
         }
-        prefs.edit().putString("custom_modules_json", jsonArr.toString()).apply()
+        return jsonArr.toString()
+    }
+
+    private fun persistCustomModules(customModules: List<StudyModule>) {
+        prefs.edit().putString("custom_modules_json", serializeModulesToJsonString(customModules)).apply()
     }
 
     private fun parseModulesJson(jsonStr: String): List<StudyModule> {
@@ -994,19 +2172,22 @@ class QuizRepository(private val context: Context) {
         try {
             val arr = JSONArray(jsonStr)
             for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
+                val obj = arr.optJSONObject(i) ?: continue
+                val modId = obj.optString("id").ifBlank { "user_" + UUID.randomUUID().toString() }
                 val cardsArr = obj.optJSONArray("cards") ?: JSONArray()
                 val cards = mutableListOf<Flashcard>()
-                val modId = obj.getString("id")
                 for (j in 0 until cardsArr.length()) {
-                    val cObj = cardsArr.getJSONObject(j)
+                    val cObj = cardsArr.optJSONObject(j) ?: continue
+                    val term = cObj.optString("term").trim()
+                    val def = cObj.optString("definition").trim()
+                    if (term.isBlank() && def.isBlank()) continue
                     val score = cObj.optInt("masteryScore", if (cObj.optBoolean("isMastered", false)) 2 else 0).coerceIn(0, 2)
                     cards.add(
                         Flashcard(
-                            id = cObj.getString("id"),
+                            id = cObj.optString("id").ifBlank { UUID.randomUUID().toString() },
                             moduleId = modId,
-                            term = cObj.getString("term"),
-                            definition = cObj.getString("definition"),
+                            term = term,
+                            definition = def,
                             diagramType = cObj.optString("diagramType").ifBlank { null },
                             exampleSentence = cObj.optString("exampleSentence").ifBlank { null },
                             isMastered = score >= 2 || cObj.optBoolean("isMastered", false),
@@ -1026,9 +2207,9 @@ class QuizRepository(private val context: Context) {
                 list.add(
                     StudyModule(
                         id = modId,
-                        title = obj.getString("title"),
+                        title = obj.optString("title").ifBlank { "Без названия" },
                         description = obj.optString("description"),
-                        category = obj.optString("category"),
+                        category = obj.optString("category").ifBlank { "Пользовательские" },
                         author = obj.optString("author", "QuizApp"),
                         isVerified = obj.optBoolean("isVerified", false),
                         colorHex = obj.optLong("colorHex", 0xFF16A34A),

@@ -3,6 +3,8 @@ package com.example.quizapp.data.ai
 import android.os.Build
 import android.util.Log
 import com.example.quizapp.data.model.AiProvider
+import com.example.quizapp.data.model.ChatAttachment
+import com.example.quizapp.data.model.ChatAttachmentType
 import com.example.quizapp.data.model.Flashcard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -15,8 +17,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -25,20 +25,25 @@ sealed class FetchModelsResult {
     data class Error(val message: String) : FetchModelsResult()
 }
 
+data class AiChatTurn(
+    val text: String,
+    val isUser: Boolean,
+    val attachments: List<ChatAttachment> = emptyList()
+)
+
 class AiHttpException(val code: Int, val detailedMessage: String) : RuntimeException("HTTP $code: $detailedMessage")
 
 class AiClient {
     companion object {
         private const val TAG = "AiClient"
-        private const val AI_TIMEOUT_MS = 45_000L
-        private const val TCP_PROBE_TIMEOUT_MS = 2_000
+        private const val AI_TIMEOUT_MS = 90_000L
         const val DEFAULT_FLASHCARD_COUNT = 12
     }
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
@@ -257,6 +262,24 @@ class AiClient {
         prompt: String,
         history: List<Pair<String, Boolean>> = emptyList(),
         systemInstruction: String = "Ты — дружелюбный, умный репетитор и собеседник в QuizApp. Веди живой диалог на русском языке (или на языке вопроса). Помни контекст предыдущих сообщений диалога. Если пользователь просит объяснить тему, термин или грамматику — давай чёткое, структурированное объяснение с примерами в Markdown. Если просят карточки или слова — давай чёткие пары Термин — Определение."
+    ): String = generateChatResponse(
+        provider = provider,
+        apiKey = apiKey,
+        model = model,
+        prompt = prompt,
+        attachments = emptyList(),
+        history = history.map { AiChatTurn(text = it.first, isUser = it.second) },
+        systemInstruction = systemInstruction
+    )
+
+    suspend fun generateChatResponse(
+        provider: AiProvider,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
+        history: List<AiChatTurn> = emptyList(),
+        systemInstruction: String = "Ты — дружелюбный, умный репетитор и собеседник в QuizApp. Веди живой диалог на языке пользователя. Помни контекст предыдущих сообщений диалога и прикреплённых материалов."
     ): String = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
@@ -264,7 +287,15 @@ class AiClient {
                 return@withContext generateLocalEducationalResponse(prompt)
             }
             return@withContext "⚠️ **API-ключ не указан** для ${provider.displayName}.\n\n" +
-                "Чтобы общаться с живой нейросетью, откройте **Настройки** (значок шестерёнки вверху) -> выберите профиль -> укажите ваш рабочий API-ключ."
+                "Чтобы общаться с живой нейросетью и работать с файлами/фото, откройте **Настройки** (значок шестерёнки вверху) → выберите профиль → укажите ваш рабочий API-ключ."
+        }
+
+        val hasImageOrVisionPdf = attachments.any {
+            it.type == ChatAttachmentType.IMAGE || (it.mimeType == "application/pdf" && it.pdfPageImagesBase64.isNotEmpty())
+        }
+        if (provider == AiProvider.DEEPSEEK && hasImageOrVisionPdf) {
+            return@withContext "⚠️ **Модель ${provider.displayName} не поддерживает анализ изображений и сканов PDF напрямую.**\n\n" +
+                "Вы можете переключиться в шапке чата (круг с номером профиля) на профиль **Google Gemini**, **OpenAI** или **OpenRouter**, либо прикрепить текстовый/DOCX/CSV-файл."
         }
 
         try {
@@ -274,6 +305,7 @@ class AiClient {
                         apiKey = cleanKey,
                         model = resolveSupportedGeminiModel(model),
                         prompt = prompt,
+                        attachments = attachments,
                         systemInstruction = systemInstruction,
                         history = history
                     )
@@ -282,6 +314,7 @@ class AiClient {
                         apiKey = cleanKey,
                         model = model.ifBlank { provider.defaultModel },
                         prompt = prompt,
+                        attachments = attachments,
                         systemInstruction = systemInstruction,
                         provider = provider,
                         history = history
@@ -291,6 +324,7 @@ class AiClient {
                         apiKey = cleanKey,
                         model = model.ifBlank { provider.defaultModel },
                         prompt = prompt,
+                        attachments = attachments,
                         systemInstruction = systemInstruction,
                         provider = provider,
                         history = history
@@ -300,6 +334,7 @@ class AiClient {
                         apiKey = cleanKey,
                         model = model.ifBlank { provider.defaultModel },
                         prompt = prompt,
+                        attachments = attachments,
                         systemInstruction = systemInstruction,
                         provider = provider,
                         history = history
@@ -308,6 +343,7 @@ class AiClient {
                         apiKey = cleanKey,
                         model = model.ifBlank { provider.defaultModel },
                         prompt = prompt,
+                        attachments = attachments,
                         systemInstruction = systemInstruction,
                         history = history
                     )
@@ -319,8 +355,8 @@ class AiClient {
                 "• Код ответа: `HTTP ${e.code}`\n\n" +
                 "Проверьте правильность API-ключа и выбранной модели в Настройках."
         } catch (e: TimeoutCancellationException) {
-            "⚠️ **Превышено время ожидания ответа (таймаут 15 сек)** от ${provider.displayName}.\n\n" +
-                "Сервер долго не отвечал. Попробуйте повторить запрос ещё раз."
+            "⚠️ **Превышено время ожидания ответа (таймаут 90 сек)** от ${provider.displayName}.\n\n" +
+                "Сервер долго не отвечал. Попробуйте повторить запрос или уменьшить размер текста/файла."
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -330,28 +366,45 @@ class AiClient {
         }
     }
 
+    private fun buildTextWithTextAttachments(text: String, attachments: List<ChatAttachment>, isHistorical: Boolean): String {
+        val textDocs = attachments.filter { !it.extractedText.isNullOrBlank() }
+        if (textDocs.isEmpty()) return text
+        val sb = StringBuilder()
+        val charLimit = if (isHistorical) 8_000 else 28_000
+        for (doc in textDocs) {
+            val content = doc.extractedText.orEmpty()
+            val trimmedContent = if (content.length > charLimit) content.take(charLimit) + "\n[...сокращено...]" else content
+            sb.append("[Прикреплённый файл «${doc.name}»]:\n").append(trimmedContent).append("\n\n")
+        }
+        if (text.isNotBlank()) {
+            sb.append(text)
+        }
+        return sb.toString().trim()
+    }
+
     private fun callGeminiDirectHttp(
         apiKey: String,
         model: String,
         prompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
         systemInstruction: String,
-        history: List<Pair<String, Boolean>> = emptyList()
+        history: List<AiChatTurn> = emptyList()
     ): String {
-        val cleanModel = model.removePrefix("models/").ifBlank { "gemini-2.0-flash" }
-        val primaryResult = executeGeminiRequest(apiKey, cleanModel, prompt, systemInstruction, history)
+        val cleanModel = model.removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+        val primaryResult = executeGeminiRequest(apiKey, cleanModel, prompt, attachments, systemInstruction, history)
         if (primaryResult.isSuccess) {
             return primaryResult.getOrThrow()
         }
 
         val err = primaryResult.exceptionOrNull()
-        if (err is AiHttpException && err.code == 404 && cleanModel != "gemini-2.0-flash") {
-            val fallback20 = executeGeminiRequest(apiKey, "gemini-2.0-flash", prompt, systemInstruction, history)
-            if (fallback20.isSuccess) {
-                return fallback20.getOrThrow()
-            }
-            val fallback15 = executeGeminiRequest(apiKey, "gemini-1.5-flash", prompt, systemInstruction, history)
-            if (fallback15.isSuccess) {
-                return fallback15.getOrThrow()
+        if (err is AiHttpException && err.code == 404) {
+            val fallbacks = listOf("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash")
+                .filter { !it.equals(cleanModel, ignoreCase = true) }
+            for (fbModel in fallbacks) {
+                val fbResult = executeGeminiRequest(apiKey, fbModel, prompt, attachments, systemInstruction, history)
+                if (fbResult.isSuccess) {
+                    return fbResult.getOrThrow()
+                }
             }
         }
 
@@ -359,12 +412,55 @@ class AiClient {
         throw RuntimeException("Неизвестная ошибка Gemini")
     }
 
+    private fun buildGeminiPartsForTurn(text: String, attachments: List<ChatAttachment>, includeMediaBytes: Boolean, isHistorical: Boolean): JSONArray {
+        return JSONArray().apply {
+            if (includeMediaBytes) {
+                for (att in attachments) {
+                    if (att.type == ChatAttachmentType.IMAGE && !att.base64Data.isNullOrBlank()) {
+                        put(JSONObject().apply {
+                            put("inline_data", JSONObject().apply {
+                                put("mime_type", att.mimeType.ifBlank { "image/jpeg" })
+                                put("data", att.base64Data)
+                            })
+                        })
+                    } else if (att.mimeType == "application/pdf") {
+                        if (!att.base64Data.isNullOrBlank()) {
+                            put(JSONObject().apply {
+                                put("inline_data", JSONObject().apply {
+                                    put("mime_type", "application/pdf")
+                                    put("data", att.base64Data)
+                                })
+                            })
+                        } else {
+                            att.pdfPageImagesBase64.forEach { pageB64 ->
+                                put(JSONObject().apply {
+                                    put("inline_data", JSONObject().apply {
+                                        put("mime_type", "image/jpeg")
+                                        put("data", pageB64)
+                                    })
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+            val mergedText = buildTextWithTextAttachments(text, attachments, isHistorical)
+            val mediaNote = if (!includeMediaBytes && attachments.any { it.type == ChatAttachmentType.IMAGE }) {
+                val names = attachments.filter { it.type == ChatAttachmentType.IMAGE }.joinToString(", ") { it.name }
+                "[Ранее прикреплённое фото: $names]\n"
+            } else ""
+            val finalText = (mediaNote + mergedText).trim().ifBlank { "Проанализируй прикреплённые материалы." }
+            put(JSONObject().put("text", finalText))
+        }
+    }
+
     private fun executeGeminiRequest(
         apiKey: String,
         cleanModel: String,
         prompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
         systemInstruction: String,
-        history: List<Pair<String, Boolean>> = emptyList()
+        history: List<AiChatTurn> = emptyList()
     ): Result<String> {
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
         val payload = JSONObject().apply {
@@ -374,20 +470,35 @@ class AiClient {
                 })
             })
             val contents = JSONArray().apply {
-                val validHistory = history.filter { it.first.isNotBlank() && !it.first.startsWith("⚠️") }.takeLast(10)
-                for (item in validHistory) {
+                val validHistory = history.filter {
+                    (it.text.isNotBlank() || it.attachments.isNotEmpty()) && !it.text.startsWith("⚠️")
+                }.takeLast(16)
+                val historyStartMediaIdx = (validHistory.size - 2).coerceAtLeast(0)
+                validHistory.forEachIndexed { idx, item ->
                     put(JSONObject().apply {
-                        put("role", if (item.second) "user" else "model")
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().put("text", item.first))
-                        })
+                        put("role", if (item.isUser) "user" else "model")
+                        put(
+                            "parts",
+                            buildGeminiPartsForTurn(
+                                text = item.text,
+                                attachments = item.attachments,
+                                includeMediaBytes = idx >= historyStartMediaIdx,
+                                isHistorical = true
+                            )
+                        )
                     })
                 }
                 put(JSONObject().apply {
                     put("role", "user")
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().put("text", prompt))
-                    })
+                    put(
+                        "parts",
+                        buildGeminiPartsForTurn(
+                            text = prompt,
+                            attachments = attachments,
+                            includeMediaBytes = true,
+                            isHistorical = false
+                        )
+                    )
                 })
             }
             put("contents", contents)
@@ -409,14 +520,26 @@ class AiClient {
                 val candidates = json.optJSONArray("candidates")
                 if (candidates != null && candidates.length() > 0) {
                     val candidate = candidates.getJSONObject(0)
-                    val parts = candidate.getJSONObject("content").getJSONArray("parts")
-                    val textBuilder = StringBuilder()
-                    for (i in 0 until parts.length()) {
-                        textBuilder.append(parts.getJSONObject(i).optString("text"))
+                    val contentObj = candidate.optJSONObject("content")
+                    val parts = contentObj?.optJSONArray("parts")
+                    if (parts != null && parts.length() > 0) {
+                        val textBuilder = StringBuilder()
+                        for (i in 0 until parts.length()) {
+                            textBuilder.append(parts.getJSONObject(i).optString("text"))
+                        }
+                        val extracted = textBuilder.toString().trim()
+                        if (extracted.isNotEmpty()) {
+                            return Result.success(extracted)
+                        }
                     }
-                    return Result.success(textBuilder.toString())
+                    val finishReason = candidate.optString("finishReason")
+                    return Result.success("⚠️ Модель не вернула текст ответа (причина: ${finishReason.ifBlank { "неизвестно" }}). Попробуйте переформулировать запрос.")
                 }
-                Result.success(body)
+                val blockReason = json.optJSONObject("promptFeedback")?.optString("blockReason").orEmpty()
+                if (blockReason.isNotBlank()) {
+                    return Result.success("⚠️ Запрос был отклонён фильтрами безопасности модели ($blockReason). Попробуйте переформулировать.")
+                }
+                Result.success("⚠️ Не удалось получить текстовый ответ от модели. Попробуйте ещё раз.")
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -553,24 +676,90 @@ class AiClient {
         )
     }
 
+    private fun buildOpenAiMessageContent(
+        text: String,
+        attachments: List<ChatAttachment>,
+        includeMediaBytes: Boolean,
+        isHistorical: Boolean,
+        provider: AiProvider
+    ): Any {
+        val mergedText = buildTextWithTextAttachments(text, attachments, isHistorical)
+        val imagePayloads = if (includeMediaBytes && provider != AiProvider.DEEPSEEK) {
+            attachments.flatMap { att ->
+                when {
+                    att.type == ChatAttachmentType.IMAGE && !att.base64Data.isNullOrBlank() ->
+                        listOf((att.mimeType.ifBlank { "image/jpeg" }) to att.base64Data)
+                    att.mimeType == "application/pdf" && att.pdfPageImagesBase64.isNotEmpty() ->
+                        att.pdfPageImagesBase64.map { "image/jpeg" to it }
+                    else -> emptyList()
+                }
+            }
+        } else emptyList()
+
+        if (imagePayloads.isEmpty()) {
+            val mediaNote = if (!includeMediaBytes && attachments.any { it.type == ChatAttachmentType.IMAGE }) {
+                val names = attachments.filter { it.type == ChatAttachmentType.IMAGE }.joinToString(", ") { it.name }
+                "[Ранее прикреплённое фото: $names]\n"
+            } else ""
+            return (mediaNote + mergedText).trim().ifBlank { "Проанализируй прикреплённые материалы." }
+        }
+
+        return JSONArray().apply {
+            val finalPrompt = mergedText.ifBlank { "Проанализируй прикреплённые материалы и помоги пользователю." }
+            put(JSONObject().put("type", "text").put("text", finalPrompt))
+            for ((mime, b64) in imagePayloads) {
+                put(JSONObject().apply {
+                    put("type", "image_url")
+                    put("image_url", JSONObject().put("url", "data:$mime;base64,$b64"))
+                })
+            }
+        }
+    }
+
     private fun callOpenAiCompatible(
         url: String,
         apiKey: String,
         model: String,
         prompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
         systemInstruction: String,
         provider: AiProvider,
-        history: List<Pair<String, Boolean>> = emptyList()
+        history: List<AiChatTurn> = emptyList()
     ): String {
         val payload = JSONObject().apply {
             put("model", model)
             val messages = JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", systemInstruction))
-                val validHistory = history.filter { it.first.isNotBlank() && !it.first.startsWith("⚠️") }.takeLast(10)
-                for (item in validHistory) {
-                    put(JSONObject().put("role", if (item.second) "user" else "assistant").put("content", item.first))
+                val validHistory = history.filter {
+                    (it.text.isNotBlank() || it.attachments.isNotEmpty()) && !it.text.startsWith("⚠️")
+                }.takeLast(16)
+                val historyStartMediaIdx = (validHistory.size - 2).coerceAtLeast(0)
+                validHistory.forEachIndexed { idx, item ->
+                    val content = if (item.isUser) {
+                        buildOpenAiMessageContent(
+                            text = item.text,
+                            attachments = item.attachments,
+                            includeMediaBytes = idx >= historyStartMediaIdx,
+                            isHistorical = true,
+                            provider = provider
+                        )
+                    } else {
+                        item.text
+                    }
+                    put(JSONObject().put("role", if (item.isUser) "user" else "assistant").put("content", content))
                 }
-                put(JSONObject().put("role", "user").put("content", prompt))
+                put(
+                    JSONObject().put("role", "user").put(
+                        "content",
+                        buildOpenAiMessageContent(
+                            text = prompt,
+                            attachments = attachments,
+                            includeMediaBytes = true,
+                            isHistorical = false,
+                            provider = provider
+                        )
+                    )
+                )
             }
             put("messages", messages)
         }
@@ -590,9 +779,53 @@ class AiClient {
             val json = JSONObject(body)
             val choices = json.optJSONArray("choices")
             if (choices != null && choices.length() > 0) {
-                return choices.getJSONObject(0).getJSONObject("message").optString("content")
+                val msgContent = choices.getJSONObject(0).optJSONObject("message")?.optString("content").orEmpty().trim()
+                if (msgContent.isNotEmpty()) return msgContent
             }
-            return body
+            return "⚠️ Модель не вернула текстовый ответ. Попробуйте повторить запрос."
+        }
+    }
+
+    private fun buildAnthropicMessageContent(
+        text: String,
+        attachments: List<ChatAttachment>,
+        includeMediaBytes: Boolean,
+        isHistorical: Boolean
+    ): Any {
+        val mergedText = buildTextWithTextAttachments(text, attachments, isHistorical)
+        val imagePayloads = if (includeMediaBytes) {
+            attachments.flatMap { att ->
+                when {
+                    att.type == ChatAttachmentType.IMAGE && !att.base64Data.isNullOrBlank() ->
+                        listOf((att.mimeType.ifBlank { "image/jpeg" }) to att.base64Data)
+                    att.mimeType == "application/pdf" && att.pdfPageImagesBase64.isNotEmpty() ->
+                        att.pdfPageImagesBase64.map { "image/jpeg" to it }
+                    else -> emptyList()
+                }
+            }
+        } else emptyList()
+
+        if (imagePayloads.isEmpty()) {
+            val mediaNote = if (!includeMediaBytes && attachments.any { it.type == ChatAttachmentType.IMAGE }) {
+                val names = attachments.filter { it.type == ChatAttachmentType.IMAGE }.joinToString(", ") { it.name }
+                "[Ранее прикреплённое фото: $names]\n"
+            } else ""
+            return (mediaNote + mergedText).trim().ifBlank { "Проанализируй прикреплённые материалы." }
+        }
+
+        return JSONArray().apply {
+            for ((mime, b64) in imagePayloads) {
+                put(JSONObject().apply {
+                    put("type", "image")
+                    put("source", JSONObject().apply {
+                        put("type", "base64")
+                        put("media_type", mime)
+                        put("data", b64)
+                    })
+                })
+            }
+            val finalPrompt = mergedText.ifBlank { "Проанализируй прикреплённые материалы и помоги пользователю." }
+            put(JSONObject().put("type", "text").put("text", finalPrompt))
         }
     }
 
@@ -600,20 +833,44 @@ class AiClient {
         apiKey: String,
         model: String,
         prompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
         systemInstruction: String,
-        history: List<Pair<String, Boolean>> = emptyList()
+        history: List<AiChatTurn> = emptyList()
     ): String {
         val url = "https://api.anthropic.com/v1/messages"
         val payload = JSONObject().apply {
             put("model", model)
-            put("max_tokens", 1536)
+            put("max_tokens", 4096)
             put("system", systemInstruction)
             val messages = JSONArray().apply {
-                val validHistory = history.filter { it.first.isNotBlank() && !it.first.startsWith("⚠️") }.takeLast(10)
-                for (item in validHistory) {
-                    put(JSONObject().put("role", if (item.second) "user" else "assistant").put("content", item.first))
+                val validHistory = history.filter {
+                    (it.text.isNotBlank() || it.attachments.isNotEmpty()) && !it.text.startsWith("⚠️")
+                }.takeLast(16)
+                val historyStartMediaIdx = (validHistory.size - 2).coerceAtLeast(0)
+                validHistory.forEachIndexed { idx, item ->
+                    val content = if (item.isUser) {
+                        buildAnthropicMessageContent(
+                            text = item.text,
+                            attachments = item.attachments,
+                            includeMediaBytes = idx >= historyStartMediaIdx,
+                            isHistorical = true
+                        )
+                    } else {
+                        item.text
+                    }
+                    put(JSONObject().put("role", if (item.isUser) "user" else "assistant").put("content", content))
                 }
-                put(JSONObject().put("role", "user").put("content", prompt))
+                put(
+                    JSONObject().put("role", "user").put(
+                        "content",
+                        buildAnthropicMessageContent(
+                            text = prompt,
+                            attachments = attachments,
+                            includeMediaBytes = true,
+                            isHistorical = false
+                        )
+                    )
+                )
             }
             put("messages", messages)
         }
@@ -634,9 +891,10 @@ class AiClient {
             val json = JSONObject(body)
             val contentArr = json.optJSONArray("content")
             if (contentArr != null && contentArr.length() > 0) {
-                return contentArr.getJSONObject(0).optString("text")
+                val text = contentArr.getJSONObject(0).optString("text").trim()
+                if (text.isNotEmpty()) return text
             }
-            return body
+            return "⚠️ Модель не вернула текстовый ответ. Попробуйте повторить запрос."
         }
     }
 
@@ -890,23 +1148,63 @@ class AiClient {
 
     fun parseFlashcardsFromJsonOrText(text: String, moduleId: String): List<Flashcard> {
         val list = mutableListOf<Flashcard>()
+        val cleanedText = text
+            .replace(Regex("```json\\s*", RegexOption.IGNORE_CASE), "")
+            .replace("```", "")
+            .trim()
+
+        // 1. Try JSON object {"cards": [...]} or JSON array [...]
         try {
-            val startIdx = text.indexOf('[')
-            val endIdx = text.lastIndexOf(']')
+            val objStart = cleanedText.indexOf('{')
+            val objEnd = cleanedText.lastIndexOf('}')
+            if (objStart != -1 && objEnd > objStart) {
+                val candidateJson = cleanedText.substring(objStart, objEnd + 1)
+                if (candidateJson.contains("\"cards\"")) {
+                    val obj = JSONObject(candidateJson)
+                    val arr = obj.optJSONArray("cards")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val item = arr.optJSONObject(i) ?: continue
+                            val term = item.optString("term").ifBlank { item.optString("front") }.trim()
+                            val definition = item.optString("definition").ifBlank { item.optString("back") }.trim()
+                            val example = item.optString("example").ifBlank { item.optString("exampleSentence") }.ifBlank { null }
+                            if (term.isNotBlank() && definition.isNotBlank()) {
+                                list.add(
+                                    Flashcard(
+                                        id = UUID.randomUUID().toString(),
+                                        moduleId = moduleId,
+                                        term = term,
+                                        definition = definition,
+                                        exampleSentence = example
+                                    )
+                                )
+                            }
+                        }
+                        if (list.isNotEmpty()) return list
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        try {
+            val startIdx = cleanedText.indexOf('[')
+            val endIdx = cleanedText.lastIndexOf(']')
             if (startIdx != -1 && endIdx != -1 && endIdx > startIdx) {
-                val jsonStr = text.substring(startIdx, endIdx + 1)
+                val jsonStr = cleanedText.substring(startIdx, endIdx + 1)
                 val jsonArr = JSONArray(jsonStr)
                 for (i in 0 until jsonArr.length()) {
-                    val obj = jsonArr.getJSONObject(i)
-                    val term = obj.optString("term").ifBlank { obj.optString("front") }
-                    val definition = obj.optString("definition").ifBlank { obj.optString("back") }
+                    val obj = jsonArr.optJSONObject(i) ?: continue
+                    val term = obj.optString("term").ifBlank { obj.optString("front") }.trim()
+                    val definition = obj.optString("definition").ifBlank { obj.optString("back") }.trim()
+                    val example = obj.optString("example").ifBlank { obj.optString("exampleSentence") }.ifBlank { null }
                     if (term.isNotBlank() && definition.isNotBlank()) {
                         list.add(
                             Flashcard(
                                 id = UUID.randomUUID().toString(),
                                 moduleId = moduleId,
-                                term = term.trim(),
-                                definition = definition.trim()
+                                term = term,
+                                definition = definition,
+                                exampleSentence = example
                             )
                         )
                     }
@@ -915,43 +1213,51 @@ class AiClient {
             }
         } catch (_: Exception) {}
 
-        // Fallback line parser if model responded with lines (e.g. "Term - Definition")
-        val lines = text.lines()
+        // 2. Fallback line parser if model responded with clean structured lines (e.g. "1. Term — Definition")
+        val lines = cleanedText.lines()
+        val proseLeadWords = setOf(
+            "вопрос", "ответ", "пример", "примечание", "важно", "итог", "итак",
+            "вывод", "шаг", "главное", "совет", "по", "на", "до", "если", "когда",
+            "почему", "зачем", "как", "что", "тут", "здесь"
+        )
         for (line in lines) {
-            val clean = line.trim().removePrefix("-").removePrefix("*").removePrefix("•").trim()
-            if (clean.contains(" — ")) {
-                val parts = clean.split(" — ", limit = 2)
+            val rawTrimmed = line.trim()
+            val isListLine = rawTrimmed.matches(Regex("^(\\d+[.)]|[-*•])\\s+.*"))
+            val clean = rawTrimmed
+                .replace(Regex("^\\d+[.)]\\s*"), "")
+                .removePrefix("-").removePrefix("*").removePrefix("•").trim()
+            if (clean.length < 6 || clean.startsWith("#") || clean.startsWith("```") || clean.startsWith(">")) continue
+
+            val separatorUsed: String?
+            val parts = when {
+                clean.contains(" — ") -> { separatorUsed = "—"; clean.split(" — ", limit = 2) }
+                clean.contains(" – ") -> { separatorUsed = "–"; clean.split(" – ", limit = 2) }
+                clean.contains(" - ") -> { separatorUsed = "-"; clean.split(" - ", limit = 2) }
+                clean.contains(": ") -> { separatorUsed = ":"; clean.split(": ", limit = 2) }
+                else -> { separatorUsed = null; null }
+            }
+            if (parts != null && parts.size == 2 && separatorUsed != null) {
                 val termPart = parts[0].replace("**", "").trim()
                 val defPart = parts[1].replace("**", "").trim()
-                if (termPart.length in 2..60 && defPart.length >= 4) {
-                    list.add(
-                        Flashcard(
-                            id = UUID.randomUUID().toString(),
-                            moduleId = moduleId,
-                            term = termPart,
-                            definition = defPart
-                        )
-                    )
-                }
-            } else if (clean.contains(" - ")) {
-                val parts = clean.split(" - ", limit = 2)
-                val termPart = parts[0].replace("**", "").trim()
-                val defPart = parts[1].replace("**", "").trim()
-                if (termPart.length in 2..60 && defPart.length >= 4) {
-                    list.add(
-                        Flashcard(
-                            id = UUID.randomUUID().toString(),
-                            moduleId = moduleId,
-                            term = termPart,
-                            definition = defPart
-                        )
-                    )
-                }
-            } else if (clean.contains(": ") && !clean.startsWith("#")) {
-                val parts = clean.split(": ", limit = 2)
-                val termPart = parts[0].replace("**", "").trim()
-                val defPart = parts[1].replace("**", "").trim()
-                if (termPart.length in 2..60 && defPart.length >= 4) {
+                val wordCount = termPart.split(Regex("\\s+")).count { it.isNotBlank() }
+                val firstWord = termPart.lowercase().split(Regex("\\s+")).firstOrNull().orEmpty()
+                val hasUnbalancedParens = termPart.count { it == '(' } != termPart.count { it == ')' }
+                val looksLikeProseFragment = hasUnbalancedParens ||
+                    termPart.contains(").") ||
+                    termPart.contains(". ") ||
+                    termPart.contains("?") ||
+                    termPart.contains("!") ||
+                    termPart.endsWith(".") ||
+                    termPart.endsWith(",") ||
+                    wordCount > 6 ||
+                    (separatorUsed == ":" && (!isListLine || wordCount > 3 || defPart.endsWith("?"))) ||
+                    firstWord in proseLeadWords ||
+                    termPart.startsWith("главное", ignoreCase = true) ||
+                    termPart.startsWith("по задачам", ignoreCase = true) ||
+                    termPart.startsWith("по группам", ignoreCase = true) ||
+                    termPart.startsWith("на чём", ignoreCase = true) ||
+                    termPart.startsWith("например", ignoreCase = true)
+                if (!looksLikeProseFragment && termPart.length in 2..50 && defPart.length >= 3) {
                     list.add(
                         Flashcard(
                             id = UUID.randomUUID().toString(),
